@@ -1,9 +1,9 @@
-// This is a basic Flutter widget test.
+// Smoke test for the CloudLens app shell.
 //
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
+// MyApp resolves the current Amplify session before deciding whether to show
+// LoginPage or MainPage. Amplify is not configured inside a widget test, so
+// this test asserts on the first frame, which is rendered while that session
+// lookup is still pending.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -11,20 +11,20 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:cloud_lens/main.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
+  testWidgets('shows a loading indicator while the session is resolved', (
+    WidgetTester tester,
+  ) async {
     await tester.pumpWidget(const MyApp());
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
+    expect(find.byType(CircularProgressIndicator), findsOneWidget);
+  });
 
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
-    await tester.pump();
+  testWidgets('builds a MaterialApp titled Cloud Lens', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(const MyApp());
 
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    final MaterialApp app = tester.widget(find.byType(MaterialApp));
+    expect(app.title, 'Cloud Lens');
   });
 }
