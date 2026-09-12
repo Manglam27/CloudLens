@@ -1,9 +1,47 @@
 # Cloud Lens
 
-A Flutter app for capturing, uploading and manipulating images in the cloud,
-backed by AWS Amplify (Cognito authentication + S3 storage).
+**ICSI 499 Capstone Project — University at Albany, SUNY**
 
-**Target platforms: iOS and Android.**
+Cloud Lens is a cross-platform mobile app for iOS and Android that lets you
+capture, store and edit your photos in the cloud. Sign in, take a picture or
+pick one from your device, and it is uploaded to your own private cloud library
+where you can view, edit, favorite and download it from any device you sign in
+on.
+
+Authentication and storage are backed by AWS Amplify — Amazon Cognito manages
+user accounts, and Amazon S3 holds each user's images.
+
+## Features
+
+- **Account management** — sign up and sign in with Amazon Cognito
+- **Capture** — take photos with the in-app camera, or import from your device
+- **Cloud library** — images upload to private per-user S3 storage
+- **Editing** — manipulate images and save the results back to the cloud
+- **Favorites** — mark images to find them again quickly
+- **Download** — save any cloud image back to your device gallery
+- **AI Detection (FAX Check)** — *new in this version*, see below
+
+## AI Detection (FAX Check)
+
+This release introduces **AI Detection**, also called **FAX Check** — a way to
+find out whether a photo is real or AI-generated.
+
+It works like this:
+
+1. The user takes a picture, or selects one already in their cloud library.
+2. On the **photo library page**, they press the **AI Detection** button.
+3. The image is sent to the Cloud Lens backend server for analysis.
+4. The server runs image-processing and detection models against it, and
+   determines whether the image was AI-generated or authentically captured.
+5. The result is returned to the app and shown to the user, along with
+   supporting facts about the image that explain the verdict.
+
+The analysis runs **server-side** rather than on the device, so detection models
+can be updated and improved without shipping a new version of the app.
+
+## Target platforms
+
+iOS and Android.
 
 ## Requirements
 
@@ -27,7 +65,7 @@ backed by AWS Amplify (Cognito authentication + S3 storage).
 2. Create `lib/amplifyconfiguration.dart`. **This file is gitignored** because it
    holds your AWS identifiers, so it is not in the repository. It must export an
    `amplifyconfig` string containing your Cognito User Pool and S3 bucket
-   details — see the AWS Amplify docs for the full schema.
+   details — see the AWS Amplify documentation for the full schema.
 
 3. Run on a connected device or emulator:
 
@@ -48,7 +86,8 @@ lib/
     signup.dart              Cognito registration
     main_page.dart           Home / navigation
     camera_page.dart         Live camera capture
-    photos_page.dart         S3 upload, listing and download
+    photos_page.dart         Cloud library: upload, listing, download,
+                             and the AI Detection (FAX Check) action
     editing_page.dart        Image manipulation
     favorites_page.dart      Saved images
 android/                     Android host project
@@ -56,13 +95,7 @@ ios/                         iOS host project
 test/                        Widget tests
 ```
 
-## Roadmap
-
-Server-side image analysis: submit an uploaded image to a backend service that
-determines whether it was AI-generated, and returns supporting details about the
-image. The `http` dependency is already in place for this client-side call.
-
-## Notes
+## Development notes
 
 - The NDK is required by the Flutter Gradle plugin even though this app ships no
   native code. If a build fails trying to provision it, install it directly:
@@ -75,3 +108,12 @@ image. The `http` dependency is already in place for this client-side call.
   Moving to AGP 9 is currently blocked by the Amplify plugins, which apply the
   Kotlin Gradle Plugin and pin mismatched `compileSdk` values. Upgrading requires
   relaxing the exact `amplify_storage_s3: 2.6.1` pin first.
+
+## License
+
+Copyright (c) 2026 Manglam Patel and the CloudLens Capstone Team.
+**All Rights Reserved.**
+
+This project is proprietary. No permission is granted to use, copy, modify or
+distribute this software or its source code without prior written consent of the
+copyright holders. See [LICENSE](LICENSE) for the full terms.
