@@ -1,10 +1,8 @@
-import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:amplify_flutter/amplify_flutter.dart';
 import 'package:uuid/uuid.dart';
-import 'package:http/http.dart' as http;
 import 'package:cloud_lens/Pages/editing_page.dart';
 import 'package:cloud_lens/database.dart'; // For DBHelper.insertFavorite
 
@@ -71,35 +69,41 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
       final user = await Amplify.Auth.getCurrentUser();
       final userID = user.userId;
       final photoID = Uuid().v4();
-      final fileName = '$userID' + '_' + photoID + '.jpg';
+      final fileName = '${userID}_$photoID.jpg';
 
       final bytes = await _selectedImage!.readAsBytes();
-      final base64String = base64Encode(bytes);
 
-      final url = 'https://s8fac61i71.execute-api.us-east-1.amazonaws.com/default/S3BucketUpload/upload';
+      // Upload straight to the configured S3 bucket using the signed-in
+      // user's Cognito identity pool credentials.
+      await Amplify.Storage.uploadData(
+        data: StorageDataPayload.bytes(bytes, contentType: 'image/jpeg'),
+        path: StoragePath.fromString(fileName),
+      ).result;
 
-      final response = await http.post(
-        Uri.parse(url),
-        headers: {'Content-Type': 'application/json'},
-        body: json.encode({
-          'file_name': fileName,
-          'body': base64String,
-        }),
+      final cloudImageURL = await _fetchCloudImageURL(fileName);
+      if (!mounted) return;
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (context) => EditingImages(imageUrl: cloudImageURL),
+        ),
       );
-
-      if (response.statusCode == 200) {
-        final cloudImageURL = await _fetchCloudImageURL(fileName);
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (context) => EditingImages(imageUrl: cloudImageURL),
-          ),
+      await _fetchCloudImages();
+      await _loadLocalImagesFromPictures();
+    } on StorageException catch (e) {
+      print("Error uploading image: ${e.message}");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Upload failed: ${e.message}')),
         );
-        await _fetchCloudImages();
-        await _loadLocalImagesFromPictures();
       }
     } catch (e) {
       print("Error uploading image: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Upload failed: $e')),
+        );
+      }
     }
   }
 
