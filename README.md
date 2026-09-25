@@ -90,6 +90,9 @@ lib/
                              and the AI Detection (FAX Check) action
     editing_page.dart        Image manipulation
     favorites_page.dart      Saved images
+backend/
+  photo_edits/               AWS Lambda for the 12 editing effects
+                             (see backend/photo_edits/README.md)
 android/                     Android host project
 ios/                         iOS host project
 test/                        Widget tests

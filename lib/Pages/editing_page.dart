@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_gallery_saver_plus/image_gallery_saver_plus.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
+import 'package:amplify_flutter/amplify_flutter.dart';
+import 'package:uuid/uuid.dart';
 import 'package:cloud_lens/database.dart'; // only if you use _saveToFavorites
 
 class EditingImages extends StatefulWidget {
@@ -20,7 +22,14 @@ class _EditingImagesState extends State<EditingImages> {
   String? editedImageUrl;
   bool isLoading = false;
 
-  final String lambdaEndpoint = 'https://rxig6sxm4d.execute-api.us-east-1.amazonaws.com/default/photoEdits';
+  /// S3 key of the edit on screen while it is still an unsaved preview in the
+  /// temporary edited/ folder. It is deleted unless the user saves it.
+  String? _previewKey;
+
+  /// The in-progress or finished move of the current edit into the library.
+  Future<void>? _keepFuture;
+
+  final String lambdaEndpoint = 'https://ieip1diyzc.execute-api.us-east-1.amazonaws.com/photoEdits';
 
   final List<String> editOptions = [
     'invert',
@@ -76,10 +85,21 @@ class _EditingImagesState extends State<EditingImages> {
 
       if (response.statusCode == 200) {
         final body = jsonDecode(response.body);
+        final newPreviewKey = body['key'] as String?;
+        if (!mounted) {
+          // The user left while the edit was being made, so nobody wants it.
+          if (newPreviewKey != null) _discardPreview(newPreviewKey);
+          return;
+        }
+        final previousPreviewKey = _previewKey;
         setState(() {
           editedImageUrl = body['url'];
           editedImageBytes = null; // Clear memory version when switching to network
+          _previewKey = newPreviewKey;
+          _keepFuture = null;
         });
+        // The user moved on from the previous filter without saving it.
+        if (previousPreviewKey != null) _discardPreview(previousPreviewKey);
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text("❌ Failed: ${response.body}")),
@@ -89,11 +109,73 @@ class _EditingImagesState extends State<EditingImages> {
       print('Error calling Lambda: $e');
     }
 
-    setState(() => isLoading = false);
+    if (mounted) setState(() => isLoading = false);
+  }
+
+  @override
+  void dispose() {
+    // Leaving without saving: the preview on screen is not wanted any more.
+    final previewKey = _previewKey;
+    if (previewKey != null) _discardPreview(previewKey);
+    super.dispose();
+  }
+
+  /// Deletes an unsaved edit preview from S3. Runs in the background; if it
+  /// fails, the bucket's lifecycle rule removes the preview within a day.
+  void _discardPreview(String key) {
+    Amplify.Storage.remove(path: StoragePath.fromString(key)).result.then(
+      (_) {},
+      onError: (Object e) => print('Could not discard edit preview $key: $e'),
+    );
+  }
+
+  /// Keeps the edit on screen: moves it out of the temporary edited/ folder
+  /// into the user's library, where it shows up in the Cloud tab. Safe to call
+  /// more than once; the same edit is only moved once.
+  Future<void> _keepCurrentEdit() => _keepFuture ??= _moveEditToLibrary();
+
+  Future<void> _moveEditToLibrary() async {
+    final previewKey = _previewKey;
+    if (previewKey == null) return; // Original photo, or already kept.
+
+    // Claim it first, so closing the page mid-move does not delete it.
+    _previewKey = null;
+    setState(() => isLoading = true);
+    try {
+      final user = await Amplify.Auth.getCurrentUser();
+      final libraryKey = '${user.userId}_${const Uuid().v4()}.jpg';
+      await Amplify.Storage.copy(
+        source: StoragePath.fromString(previewKey),
+        destination: StoragePath.fromString(libraryKey),
+      ).result;
+      final urlResult =
+          await Amplify.Storage.getUrl(path: StoragePath.fromString(libraryKey)).result;
+      _discardPreview(previewKey);
+      if (mounted) setState(() => editedImageUrl = urlResult.url.toString());
+    } catch (e) {
+      // Put it back so it is still cleaned up later and a retry can keep it.
+      _previewKey ??= previewKey;
+      _keepFuture = null;
+      rethrow;
+    } finally {
+      if (mounted) setState(() => isLoading = false);
+    }
+  }
+
+  void _showMessage(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
   }
 
   Future<void> _saveImage() async {
     if (editedImageBytes == null && editedImageUrl == null) return;
+    try {
+      await _keepCurrentEdit();
+    } catch (e) {
+      print('Could not keep edit: $e');
+      _showMessage("❌ Could not save the edit. Please try again.");
+      return;
+    }
     try {
       Uint8List bytes;
       if (editedImageBytes != null) {
@@ -116,7 +198,15 @@ class _EditingImagesState extends State<EditingImages> {
   }
 
   Future<void> _saveToFavorites() async {
-    String urlToSave = editedImageUrl ?? widget.imageUrl;  
+    try {
+      // A favorite stores the image's cloud link, so the edit must be kept.
+      await _keepCurrentEdit();
+    } catch (e) {
+      print('Could not keep edit: $e');
+      _showMessage("❌ Could not save the edit. Please try again.");
+      return;
+    }
+    String urlToSave = editedImageUrl ?? widget.imageUrl;
     print('Attempting to save URL: $urlToSave'); // Debugging line
     if (urlToSave.isNotEmpty) {
       try {
