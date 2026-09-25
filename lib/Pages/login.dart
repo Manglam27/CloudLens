@@ -1,5 +1,7 @@
+import 'package:cloud_lens/Pages/confirm_signup.dart';
 import 'package:cloud_lens/Pages/main_page.dart';
 import 'package:cloud_lens/Pages/signup.dart';
+import 'package:amplify_auth_cognito/amplify_auth_cognito.dart';
 import 'package:amplify_flutter/amplify_flutter.dart';
 import 'package:flutter/material.dart';
 
@@ -31,6 +33,26 @@ class _LoginPageState extends State<LoginPage> {
       } else {
         showErrorSnackBar('Sign-in failed. Please check your credentials and try again.');
       }
+    } on UserNotConfirmedException {
+      // The account exists but was never verified. Send a fresh code and let
+      // the user finish verification rather than leaving them stuck.
+      try {
+        await Amplify.Auth.resendSignUpCode(username: email);
+      } on AuthException {
+        // Ignore: the confirmation page can resend the code manually.
+      }
+      if (!mounted) return;
+      showErrorSnackBar('Please verify your email to continue. We sent you a code.');
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (context) => ConfirmSignupPage(
+            signOutCallback: widget.signOutCallback,
+            email: email,
+            password: password,
+          ),
+        ),
+      );
     } catch (e) {
       String errorMessage = 'An unexpected error occurred. Please try again later.';
 
