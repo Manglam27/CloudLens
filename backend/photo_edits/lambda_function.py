@@ -179,10 +179,12 @@ def _object_key(event, file_name, operation):
     if not name.lower().endswith((".jpg", ".jpeg")):
         name += ".jpg"
 
-    # With a verified user, use the same "<userId>_" prefix as the app's own
-    # uploads so the edited image shows up in that user's cloud library.
+    # Results are previews. The app deletes them unless the user saves the
+    # edit, in which case the app moves it into the user's library itself, and
+    # a bucket lifecycle rule expires anything left under edited/ after a day.
+    # So always write under edited/, grouped by user when the caller is known.
     user_id = _user_id(event)
-    return f"{user_id}_{name}" if user_id else f"edited/{name}"
+    return f"edited/{user_id}/{name}" if user_id else f"edited/{name}"
 
 
 def lambda_handler(event, context):

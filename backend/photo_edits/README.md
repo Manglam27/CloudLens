@@ -26,11 +26,19 @@ Response (`200`):
 Errors return `400` (bad input), `413` (image over 5 MB) or `500`, with an
 `error` message.
 
-Where results are saved:
+Results are temporary previews, saved under `edited/`:
 
-- With the Cognito authorizer (step 5 below): `<userId>_<file_name>`, the same
-  prefix the app uses for uploads, so edits appear in the user's cloud library.
+- With the Cognito authorizer (step 6 below): `edited/<userId>/<file_name>`.
 - Without it: `edited/<file_name>`.
+
+The app deletes a preview when the user tries another filter or leaves the
+editor without saving. When the user saves (Save to Gallery or Add to
+Favorites), the app copies the edit into their library as
+`<userId>_<uuid>.jpg`, so it appears in the Cloud tab, and deletes the preview.
+
+The bucket also needs a lifecycle rule that expires objects under `edited/`
+after 1 day, to clean up previews the app could not delete (for example if it
+was closed mid-edit). Never store anything else under `edited/`.
 
 ## Build
 

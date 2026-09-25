@@ -85,13 +85,15 @@ class PhotoEditsTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["key"], "edited/blur_1.jpg")
 
-    def test_verified_user_results_use_the_library_prefix(self):
+    def test_verified_user_results_stay_in_the_preview_folder(self):
+        # Previews must never land in the library prefix, or they would skip
+        # both the app's discard logic and the edited/ lifecycle rule.
         sub = "44b8a418-d021-70bf-86aa-875bc10aeb8c"
         status, body = self._call(
             {"file_name": "blur_1.jpg", "body": self.image_b64, "operation": "blur"}, sub=sub
         )
         self.assertEqual(status, 200)
-        self.assertEqual(body["key"], f"{sub}_blur_1.jpg")
+        self.assertEqual(body["key"], f"edited/{sub}/blur_1.jpg")
 
     def test_path_traversal_in_file_name_is_neutralised(self):
         status, body = self._call(
