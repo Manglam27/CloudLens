@@ -1,0 +1,2 @@
+# boto3 is provided by the AWS Lambda Python runtime, so it is not bundled.
+Pillow>=11.0,<13
