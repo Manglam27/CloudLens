@@ -25,6 +25,13 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
   void initState() {
     super.initState();
     _tabController = TabController(length: 2, vsync: this);
+    // Images can be saved to the gallery from other screens while this page
+    // stays alive, so re-scan whenever the user switches to the Local tab.
+    _tabController.addListener(() {
+      if (!_tabController.indexIsChanging && _tabController.index == 0) {
+        _loadLocalImagesFromPictures();
+      }
+    });
     _fetchCloudImages();
     _loadLocalImagesFromPictures();
   }
@@ -33,18 +40,37 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
     const picturesPath = '/storage/emulated/0/Pictures';
     final picturesDir = Directory(picturesPath);
 
-    if (await picturesDir.exists()) {
-      final files = picturesDir.listSync();
-      final imageFiles = files.where((file) {
+    try {
+      if (!await picturesDir.exists()) return;
+
+      final imageFiles = picturesDir.listSync().whereType<File>().where((file) {
         final ext = file.path.toLowerCase();
-        return file is File &&
-            (ext.endsWith('.jpg') || ext.endsWith('.jpeg') || ext.endsWith('.png'));
+        return ext.endsWith('.jpg') || ext.endsWith('.jpeg') || ext.endsWith('.png');
       }).toList();
 
+      // Newest first, so an image that was just saved appears at the top.
+      final modified = {for (final file in imageFiles) file: file.lastModifiedSync()};
+      imageFiles.sort((a, b) => modified[b]!.compareTo(modified[a]!));
+
+      if (!mounted) return;
       setState(() {
-        _localImages = imageFiles.cast<File>();
+        _localImages = imageFiles;
       });
+    } on FileSystemException catch (e) {
+      print("Error reading local images: $e");
     }
+  }
+
+  /// Opens the editor, then refreshes both tabs once the user comes back,
+  /// since the editor can save images to the gallery.
+  Future<void> _openEditor(String imageUrl) async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (context) => EditingImages(imageUrl: imageUrl)),
+    );
+    if (!mounted) return;
+    await _loadLocalImagesFromPictures();
+    await _fetchCloudImages();
   }
 
   Future<void> _pickImage() async {
@@ -82,14 +108,7 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
 
       final cloudImageURL = await _fetchCloudImageURL(fileName);
       if (!mounted) return;
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (context) => EditingImages(imageUrl: cloudImageURL),
-        ),
-      );
-      await _fetchCloudImages();
-      await _loadLocalImagesFromPictures();
+      await _openEditor(cloudImageURL);
     } on StorageException catch (e) {
       print("Error uploading image: ${e.message}");
       if (mounted) {
@@ -209,12 +228,7 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
             ),
             const Spacer(),
             TextButton(
-              onPressed: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (context) => EditingImages(imageUrl: imageUrl)),
-                );
-              },
+              onPressed: () => _openEditor(imageUrl),
               child: const Text('Edit'),
             ),
             TextButton(
