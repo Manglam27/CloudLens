@@ -53,6 +53,10 @@ python -m unittest backend/photo_edits/test_lambda_function.py
 1. **Create the function.** Lambda → Create function → Author from scratch.
    Name `cloudlens-photo-edits`, runtime **Python 3.13**, architecture
    **x86_64**, execution role "Create a new role with basic Lambda permissions".
+   The runtime **must** be Python 3.13, not the console's newer default:
+   `build.py` bundles the Python 3.13 build of Pillow, and any other runtime
+   fails every request with `Runtime.ImportModuleError: cannot import name
+   '_imaging' from 'PIL'`.
 2. **Upload the code.** Code → Upload from → .zip file → `photo_edits.zip`.
    The handler must stay `lambda_function.lambda_handler`.
 3. **Configure it.** Configuration → General configuration: memory **1024 MB**,

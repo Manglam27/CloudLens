@@ -20,7 +20,7 @@ class _EditingImagesState extends State<EditingImages> {
   String? editedImageUrl;
   bool isLoading = false;
 
-  final String lambdaEndpoint = 'https://rxig6sxm4d.execute-api.us-east-1.amazonaws.com/default/photoEdits';
+  final String lambdaEndpoint = 'https://ieip1diyzc.execute-api.us-east-1.amazonaws.com/photoEdits';
 
   final List<String> editOptions = [
     'invert',
