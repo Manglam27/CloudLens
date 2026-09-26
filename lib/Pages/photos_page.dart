@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:amplify_flutter/amplify_flutter.dart';
 import 'package:uuid/uuid.dart';
+import 'package:cloud_lens/Pages/check_page.dart';
 import 'package:cloud_lens/Pages/editing_page.dart';
 import 'package:cloud_lens/database.dart'; // For DBHelper.insertFavorite
 
@@ -216,29 +217,40 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
   );
 }
 
+  /// Opens a credibility check for a cloud photo (FR 1.4). The S3 key is the
+  /// last path segment of the photo's signed URL.
+  Future<void> _openCheck(String imageUrl) async {
+    final imageKey = Uri.parse(imageUrl).pathSegments.last;
+    Navigator.pop(context); // close the photo dialog
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (context) => CheckPage(imageKey: imageKey)),
+    );
+  }
+
   AlertDialog _buildCloudImageDialog(String imageUrl) {
+    // Listing the buttons directly lets the dialog wrap them on narrow screens.
     return AlertDialog(
       content: Image.network(imageUrl, fit: BoxFit.cover),
       actions: [
-        Row(
-          children: [
-            TextButton(
-              onPressed: () async => await _saveToFavorites(imageUrl),
-              child: const Text('Favorite'),
-            ),
-            const Spacer(),
-            TextButton(
-              onPressed: () => _openEditor(imageUrl),
-              child: const Text('Edit'),
-            ),
-            TextButton(
-              onPressed: () async {
-                await _deleteCloudImage(imageUrl);
-                Navigator.pop(context);
-              },
-              child: const Text('Delete'),
-            ),
-          ],
+        TextButton(
+          onPressed: () async => await _saveToFavorites(imageUrl),
+          child: const Text('Favorite'),
+        ),
+        TextButton(
+          onPressed: () => _openCheck(imageUrl),
+          child: const Text('Check'),
+        ),
+        TextButton(
+          onPressed: () => _openEditor(imageUrl),
+          child: const Text('Edit'),
+        ),
+        TextButton(
+          onPressed: () async {
+            await _deleteCloudImage(imageUrl);
+            Navigator.pop(context);
+          },
+          child: const Text('Delete'),
         ),
       ],
     );
