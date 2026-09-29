@@ -79,3 +79,7 @@ any code change.
 2. Claim and stance with Claude on Amazon Bedrock (`MODEL_ID`), including
    Bedrock permission on the worker role.
 3. Turn on `EVIDENCE_ENABLED`; from then on results are also cached per image.
+4. If time allows: return the sources behind each verdict so the app can list
+   them.
+
+The project-wide roadmap is in the main [README](../../README.md#roadmap).

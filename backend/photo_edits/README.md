@@ -90,9 +90,10 @@ python -m unittest backend/photo_edits/test_lambda_function.py
    Integration: Lambda `cloudlens-photo-edits`. Route: `POST` `/photoEdits`.
    Stage `$default` with auto-deploy. The endpoint is
    `<Invoke URL>/photoEdits`.
-6. **Require sign-in (recommended).** In the API: Authorization → Manage
-   authorizers → Create → **JWT**. Identity source
-   `$request.header.Authorization`, issuer
-   `https://cognito-idp.us-east-1.amazonaws.com/<USER_POOL_ID>`, audience
-   `<APP_CLIENT_ID>`. Attach it to `POST /photoEdits`. The app must then send
-   the signed-in user's Cognito token in the `Authorization` header.
+6. **Require sign-in (on the roadmap).** `cloudlens-api` already has a Cognito
+   JWT authorizer, `cloudlens-cognito`, created for the `/checks` routes
+   (`backend/credibility_check/deploy.py`). Attach it to `POST /photoEdits`
+   (Routes → `POST /photoEdits` → Attach authorization) once the editing screen
+   sends the signed-in user's token in the `Authorization` header, the same way
+   `lib/check_service.dart` does. Until then `/photoEdits` is open to anyone who
+   has the URL.
