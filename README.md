@@ -4,7 +4,7 @@
 
 TEAM MEMBERS:
 
-Samiyoddin Mohammed 
+Samiyoddin Mohammed , 
 Salman Hossain Khan
 
 Cloud Lens is a cross-platform mobile app for iOS and Android that lets you
