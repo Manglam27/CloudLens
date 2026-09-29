@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:amplify_flutter/amplify_flutter.dart';
 import 'package:uuid/uuid.dart';
+import 'package:cloud_lens/Pages/check_page.dart';
 import 'package:cloud_lens/Pages/editing_page.dart';
 import 'package:cloud_lens/database.dart'; // For DBHelper.insertFavorite
 
@@ -48,9 +49,9 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
         return ext.endsWith('.jpg') || ext.endsWith('.jpeg') || ext.endsWith('.png');
       }).toList();
 
-      // Newest first, so an image that was just saved appears at the top.
+      // Oldest first, so the newest images are at the bottom of the grid.
       final modified = {for (final file in imageFiles) file: file.lastModifiedSync()};
-      imageFiles.sort((a, b) => modified[b]!.compareTo(modified[a]!));
+      imageFiles.sort((a, b) => modified[a]!.compareTo(modified[b]!));
 
       if (!mounted) return;
       setState(() {
@@ -88,8 +89,14 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
     }
   }
 
-  Future<void> _uploadImage() async {
-    if (_selectedImage == null) return;
+  void _showMessage(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  /// Uploads the selected image to S3 and returns its key, or null if it failed.
+  Future<String?> _uploadSelected() async {
+    if (_selectedImage == null) return null;
 
     try {
       final user = await Amplify.Auth.getCurrentUser();
@@ -105,24 +112,64 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
         data: StorageDataPayload.bytes(bytes, contentType: 'image/jpeg'),
         path: StoragePath.fromString(fileName),
       ).result;
-
-      final cloudImageURL = await _fetchCloudImageURL(fileName);
-      if (!mounted) return;
-      await _openEditor(cloudImageURL);
+      return fileName;
     } on StorageException catch (e) {
       print("Error uploading image: ${e.message}");
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Upload failed: ${e.message}')),
-        );
-      }
+      _showMessage('Upload failed: ${e.message}');
     } catch (e) {
       print("Error uploading image: $e");
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Upload failed: $e')),
-        );
-      }
+      _showMessage('Upload failed: $e');
+    }
+    return null;
+  }
+
+  Future<void> _uploadAndEdit() async {
+    final key = await _uploadSelected();
+    if (key == null || !mounted) return;
+    final cloudImageURL = await _fetchCloudImageURL(key);
+    if (!mounted) return;
+    await _openEditor(cloudImageURL);
+  }
+
+  /// Uploads the selected image and starts a credibility check on it (FR 1.4).
+  Future<void> _uploadAndCheck() async {
+    final key = await _uploadSelected();
+    if (key == null || !mounted) return;
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (context) => CheckPage(imageKey: key)),
+    );
+    if (!mounted) return;
+    await _fetchCloudImages();
+  }
+
+  /// Permanently deletes a photo from the phone after the user confirms.
+  Future<void> _deleteLocalImage(File file) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete photo?'),
+        content: const Text('This permanently deletes the photo from your phone. It cannot be undone.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Delete', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    try {
+      await file.delete();
+      if (!mounted) return;
+      Navigator.pop(context); // close the photo dialog
+      setState(() => _localImages.remove(file));
+      _showMessage('Photo deleted');
+    } on FileSystemException catch (e) {
+      print("Error deleting local image: $e");
+      // Android only lets an app delete photos it saved itself.
+      _showMessage("This photo couldn't be deleted. It may belong to another app.");
     }
   }
 
@@ -148,6 +195,9 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
       final filteredFiles = result.items
           .where((item) => item.path.startsWith(userID))
           .toList();
+      // Oldest first, so the newest uploads are at the bottom of the grid.
+      final epoch = DateTime.fromMillisecondsSinceEpoch(0);
+      filteredFiles.sort((a, b) => (a.lastModified ?? epoch).compareTo(b.lastModified ?? epoch));
 
       final List<String> imageUrls = [];
       for (var file in filteredFiles) {
@@ -193,52 +243,72 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
     }
   }
 
-  AlertDialog _buildLocalImageDialog(File imageFile) {
-  return AlertDialog(
-    content: Image.file(imageFile, fit: BoxFit.cover),
-    actions: [
-      Row(
-        children: [
-          const Spacer(),
+  /// [canDelete] is only true for photos in the Local tab; a photo picked from
+  /// the gallery is a temporary copy, so deleting it would mean nothing.
+  AlertDialog _buildLocalImageDialog(File imageFile, {bool canDelete = false}) {
+    void upload(Future<void> Function() then) {
+      setState(() {
+        _selectedImage = imageFile;
+      });
+      Navigator.pop(context);
+      then();
+    }
+
+    // Listing the buttons directly lets the dialog wrap them on narrow screens.
+    return AlertDialog(
+      content: Image.file(imageFile, fit: BoxFit.cover),
+      actions: [
+        if (canDelete)
           TextButton(
-            onPressed: () {
-              setState(() {
-                _selectedImage = imageFile;
-              });
-              Navigator.pop(context);
-              _uploadImage();
-            },
-            child: const Text('Upload and Edit'),
+            onPressed: () => _deleteLocalImage(imageFile),
+            child: const Text('Delete', style: TextStyle(color: Colors.red)),
           ),
-        ],
-      ),
-    ],
-  );
-}
+        TextButton(
+          onPressed: () => upload(_uploadAndCheck),
+          child: const Text('Upload and Check'),
+        ),
+        TextButton(
+          onPressed: () => upload(_uploadAndEdit),
+          child: const Text('Upload and Edit'),
+        ),
+      ],
+    );
+  }
+
+  /// Opens a credibility check for a cloud photo (FR 1.4). The S3 key is the
+  /// last path segment of the photo's signed URL.
+  Future<void> _openCheck(String imageUrl) async {
+    final imageKey = Uri.parse(imageUrl).pathSegments.last;
+    Navigator.pop(context); // close the photo dialog
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (context) => CheckPage(imageKey: imageKey)),
+    );
+  }
 
   AlertDialog _buildCloudImageDialog(String imageUrl) {
+    // Listing the buttons directly lets the dialog wrap them on narrow screens.
     return AlertDialog(
       content: Image.network(imageUrl, fit: BoxFit.cover),
       actions: [
-        Row(
-          children: [
-            TextButton(
-              onPressed: () async => await _saveToFavorites(imageUrl),
-              child: const Text('Favorite'),
-            ),
-            const Spacer(),
-            TextButton(
-              onPressed: () => _openEditor(imageUrl),
-              child: const Text('Edit'),
-            ),
-            TextButton(
-              onPressed: () async {
-                await _deleteCloudImage(imageUrl);
-                Navigator.pop(context);
-              },
-              child: const Text('Delete'),
-            ),
-          ],
+        TextButton(
+          onPressed: () async => await _saveToFavorites(imageUrl),
+          child: const Text('Favorite'),
+        ),
+        TextButton(
+          onPressed: () => _openCheck(imageUrl),
+          child: const Text('Check'),
+        ),
+        TextButton(
+          onPressed: () => _openEditor(imageUrl),
+          child: const Text('Edit'),
+        ),
+        TextButton(
+          onPressed: () async {
+            await _deleteCloudImage(imageUrl);
+            Navigator.pop(context);
+          },
+          child: const Text('Delete'),
         ),
       ],
     );
@@ -284,7 +354,7 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
                             final selected = _localImages[index];
                             showDialog(
                               context: context,
-                              builder: (context) => _buildLocalImageDialog(selected),
+                              builder: (context) => _buildLocalImageDialog(selected, canDelete: true),
                             );
                           },
                           child: Image.file(_localImages[index], fit: BoxFit.cover),

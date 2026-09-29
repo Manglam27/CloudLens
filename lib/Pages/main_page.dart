@@ -1,6 +1,7 @@
 import 'package:camera/camera.dart';
 import 'package:cloud_lens/Pages/camera_page.dart';
 import 'package:cloud_lens/Pages/favorites_page.dart';
+import 'package:cloud_lens/Pages/history_page.dart';
 import 'package:cloud_lens/Pages/photos_page.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -67,6 +68,7 @@ class _MainPageState extends State<MainPage> {
             ? Center(child: CircularProgressIndicator()) // Show loading while initializing cameras
             : [
                 const PhotosPage(),
+                const HistoryPage(),
                 const FavoritesPage(),
                 CameraPage(cameras: cameras), // Pass cameras to the CameraPage
               ][_pageIndex], // Display the selected page based on _pageIndex
@@ -98,6 +100,7 @@ class _MainPageState extends State<MainPage> {
           type: BottomNavigationBarType.fixed,
           items: const [
             BottomNavigationBarItem(icon: Icon(Icons.image), label: "Photos"),
+            BottomNavigationBarItem(icon: Icon(Icons.fact_check), label: "History"),
             BottomNavigationBarItem(icon: Icon(Icons.star), label: "Favorites"),
             BottomNavigationBarItem(icon: Icon(Icons.camera_alt), label: "Camera"),
           ],

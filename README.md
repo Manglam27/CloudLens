@@ -81,18 +81,24 @@ lib/
                              to LoginPage or MainPage
   amplifyconfiguration.dart  AWS config (gitignored - create locally)
   database.dart              Local sqflite persistence
+  check_service.dart         Client for the credibility check API
   Pages/
     login.dart               Cognito sign-in
     signup.dart              Cognito registration
-    main_page.dart           Home / navigation
+    confirm_signup.dart      E-mail verification code
+    main_page.dart           Home / navigation (Photos, History, Favorites, Camera)
     camera_page.dart         Live camera capture
     photos_page.dart         Cloud library: upload, listing, download,
-                             and the AI Detection (FAX Check) action
+                             and the Check action on cloud photos
+    check_page.dart          Credibility check progress and result
+    history_page.dart        Past checks (FR 1.6)
     editing_page.dart        Image manipulation
     favorites_page.dart      Saved images
 backend/
   photo_edits/               AWS Lambda for the 12 editing effects
                              (see backend/photo_edits/README.md)
+  credibility_check/         Check API + worker Lambdas for the credibility check
+                             (see backend/credibility_check/README.md)
 android/                     Android host project
 ios/                         iOS host project
 test/                        Widget tests
