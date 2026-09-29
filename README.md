@@ -2,6 +2,11 @@
 
 **ICSI 499 Capstone Project — University at Albany, SUNY**
 
+TEAM MEMBERS:
+
+Samiyoddin Mohammed 
+Salman Hossain Khan
+
 Cloud Lens is a cross-platform mobile app for iOS and Android that lets you
 capture, store and edit your photos in the cloud. Sign in, take a picture or
 pick one from your device, and it is uploaded to your own private cloud library
