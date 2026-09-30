@@ -3,6 +3,11 @@
 **Credibility scoring for text in screenshots**
 ICSI 499 Capstone Project, University at Albany, SUNY
 
+TEAM MEMBERS:
+
+Samiyoddin Mohammed , Salman Hossain Khan
+
+
 CloudLens is an iOS and Android app for storing, editing and checking photos in
 the cloud. Its core feature is the **credibility check**: the user uploads a
 screenshot of a social-media post, and the server reads the text, finds the
