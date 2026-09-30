@@ -4,7 +4,7 @@
 ICSI 499 Capstone Project, University at Albany, SUNY
 
 TEAM MEMBERS:
-
+Patel Manglam, Patel Dhruvin
 Samiyoddin Mohammed , Salman Hossain Khan
 
 
