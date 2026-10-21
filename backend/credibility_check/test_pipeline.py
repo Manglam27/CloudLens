@@ -13,6 +13,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE / "check_worker"))
 from fakes import ClientError, FakeTable, FakeTextract  # noqa: E402
+import claim as claim_rules  # noqa: E402
 import evidence  # noqa: E402
 import lambda_function as worker  # noqa: E402
 import llm  # noqa: E402
@@ -119,7 +120,7 @@ class EvidenceTest(unittest.TestCase):
         self.assertEqual([i["domain"] for i in items], ["snopes.com", "usatoday.com", "reuters.com"])
         self.assertEqual([i["kind"] for i in items], ["fact_check", "fact_check", "news"])
         self.assertEqual(report, {"google_fact_check": "ok", "newsapi": "ok", "guardian": "skipped",
-                                  "google_news": "failed", "bing_news": "failed"})
+                                  "google_news": "failed", "bing_news": "failed", "wikipedia": "failed"})
 
     def test_newsapi_key_travels_in_a_header_and_domains_are_trusted_only(self):
         self.web.responses = {"newsapi.org": {"status": "ok", "articles": []}}
@@ -168,7 +169,7 @@ class EvidenceTest(unittest.TestCase):
                          "REFUTES")
         self.assertEqual(evidence.fallback_stance({"kind": "fact_check", "rating": "See article",
                                                    "title": "Did Spotify remove Ed Sheeran's music?"}), "RELATED")
-        off_topic = {"kind": "fact_check", "rating": "False", "relevance": 0.1}
+        off_topic = {"kind": "fact_check", "rating": "False", "claim_match": 0.3}  # reviewed a different claim
         self.assertEqual(evidence.fallback_stance(off_topic), "UNRELATED")
 
     def test_news_stance_from_how_closely_it_matches(self):
@@ -250,7 +251,7 @@ class EvidenceTest(unittest.TestCase):
         self.assertEqual([evidence.fallback_stance(by_domain[d]) for d in ("reuters.com", "fullfact.org", "snopes.com")],
                          ["REFUTES"] * 3)  # headline, curly apostrophe, and a question answered by its summary
         self.assertEqual(report, {"google_news": "ok", "bing_news": "ok", "google_fact_check": "skipped",
-                                  "newsapi": "skipped", "guardian": "skipped"})
+                                  "newsapi": "skipped", "guardian": "skipped", "wikipedia": "skipped"})
 
     def test_fact_checks_outrank_keyword_matched_news(self):
         check = {"kind": "fact_check", "rating": "False", "title": "No, 5G does not spread COVID", "relevance": 0.8}
@@ -260,6 +261,30 @@ class EvidenceTest(unittest.TestCase):
         self.assertEqual(evidence.fallback_stances([check, news]), ["REFUTES", "RELATED"])
         self.assertEqual(evidence.fallback_stance({**check, "rating": "", "title": "Trump wrong that X equals Y"}),
                          "REFUTES")
+
+    def test_wikipedia_confirms_a_current_fact_but_not_a_past_one(self):
+        search = {"query": {"search": [{"title": "Donald Trump"}, {"title": "Joe Biden"}]}}
+        pages = {"query": {"pages": [
+            {"title": "Donald Trump", "extract": "Donald John Trump (born June 14, 1946) is an American politician "
+                                                "who is the 47th president of the United States. He served as the "
+                                                "45th president from 2017 to 2021."},
+            {"title": "Joe Biden", "extract": "Joseph Robinette Biden Jr. (born November 20, 1942) is an American "
+                                             "politician who served as the 46th president of the United States "
+                                             "from 2021 to 2025."}]}}
+
+        def web(url, timeout=None, headers=None):
+            return search if "list=search" in url else pages
+
+        evidence._http_get_json = web
+        for claim, expected in (("The president of the United States is Donald Trump.", "SUPPORTS"),
+                                ("Joe Biden is the president of the United States.", "RELATED")):
+            query = claim_rules.search_query(claim)
+            items, _ = evidence.find_evidence(query, {}, seed_sources(), 8, enabled=["wikipedia"], also_try=[claim])
+            subject = query.split()[0] if expected == "RELATED" else "Donald"
+            item = next(i for i in items if subject in i["title"])
+            with self.subTest(claim=claim):
+                self.assertEqual(evidence.fallback_stance(item), expected)
+                self.assertEqual((item["kind"], item["domain"]), ("reference", "en.wikipedia.org"))
 
     def test_copies_of_one_article_are_merged(self):
         self.web.responses = {
@@ -292,6 +317,19 @@ class EvidenceTest(unittest.TestCase):
 
         self.assertEqual(stance("Ohio chemical tank blast forces evacuations"), "SUPPORTS")
         self.assertEqual(stance("California chemical tank blast forces evacuations"), "RELATED")
+        self.assertEqual(stance("Did an Ohio chemical tank blast force evacuations?"), "RELATED")  # asks, not states
+        self.assertEqual(stance("Ohio sues chemical company over evacuations"), "RELATED")  # half the words, other story
+
+    def test_news_support_comes_from_the_headline_not_the_summary(self):
+        self.web.responses = {"bing.com": ET.fromstring("""<rss xmlns:news="https://www.bing.com/news"><channel>
+            <item><title>How much is safe to drink each day</title>
+                  <link>http://www.bing.com/news/apiclick.aspx?url=https%3a%2f%2fwww.washingtonpost.com%2fa</link>
+                  <description>Drinking two cups of coffee a day is fine; coffee cures nothing.</description>
+                  <news:Source>The Washington Post</news:Source></item>
+        </channel></rss>""")}
+        items, _ = evidence.find_evidence("Drinking two cups coffee day cures flu", {}, seed_sources(), 8,
+                                          enabled=["bing_news"])
+        self.assertEqual([evidence.fallback_stance(i) for i in items], ["RELATED"])
 
     def test_off_topic_news_is_dropped(self):
         self.web.responses = {"content.guardianapis.com": {"response": {"status": "ok", "results": [
@@ -378,8 +416,8 @@ class PipelineTest(unittest.TestCase):
         self.web.responses = {"factchecktools": {"claims": [
             review("snopes.com", "False", claimed="Coffee shortages hit cafes", title="Coffee shortage claims")]}}
         item = self.run_check(FakeClaude())
-        self.assertEqual((item["verdict"], item["score"]), ("UNVERIFIED", 0))
-        self.assertIn("Fewer than 2 independent trusted sources", item["reason"])
+        # It reviewed a different claim, so it is left out instead of deciding anything.
+        self.assertEqual((item["verdict"], item["score"], item["sources"]), ("UNVERIFIED", 50, []))
 
     def test_without_claude_ratings_still_give_a_verdict(self):
         item = self.run_check(FakeClaude(claim_stop="max_tokens", judge_stop="max_tokens"))
@@ -434,7 +472,7 @@ class PipelineTest(unittest.TestCase):
         self.web.responses = {"factchecktools": {}}
         item = self.run_check(FakeClaude())
         self.assertEqual((item["verdict"], item["score"], item["sources"]), ("UNVERIFIED", 50, []))
-        self.assertIn("neutral", item["reason"])
+        self.assertIn("were found yet", item["reason"])
 
     def test_without_claude_matching_news_counts_and_off_topic_is_hidden(self):
         worker._ssm = FakeSSM({GOOGLE_PARAM: "GKEY", NEWSAPI_PARAM: "NKEY"})
@@ -442,7 +480,7 @@ class PipelineTest(unittest.TestCase):
             {"source": {"name": "AP"}, "url": "https://apnews.com/a",
              "title": "Two cups of coffee a day cures the flu, study finds"},
             {"source": {"name": "Reuters"}, "url": "https://www.reuters.com/b",
-             "title": "Drinking coffee cures flu, doctors report", "description": "Two cups a day."},
+             "title": "Drinking two cups of coffee cures flu, doctors report", "description": "A new study."},
             {"source": {"name": "BBC"}, "url": "https://www.bbc.com/c", "title": "Flu season starts early"}]}}
         item = self.run_check(FakeClaude(claim_stop="max_tokens", judge_stop="max_tokens"))
         self.assertEqual([s["stance"] for s in item["sources"]], ["SUPPORTS", "SUPPORTS"])

@@ -1,5 +1,5 @@
 {
-  "_comment": "Seed data for the CloudLensTrustedSources table (Milestone 2 slide 7). Category weights: fact_checker and wire_service 1.0, news_outlet 0.6; any site not in the table weighs 0 and is ignored. Subdomains match their parent (factcheck.afp.com matches afp.com). deploy.py adds any missing entries without overwriting edits; manage the live table with sources.py.",
+  "_comment": "Seed data for the CloudLensTrustedSources table (Milestone 2 slide 7). Category weights: fact_checker and wire_service 1.0, news_outlet and reference 0.6; any site not in the table weighs 0 and is ignored. Subdomains match their parent (factcheck.afp.com matches afp.com). deploy.py adds any missing entries without overwriting edits; manage the live table with sources.py.",
   "sources": [
     {"domain": "africacheck.org", "name": "Africa Check", "category": "fact_checker"},
     {"domain": "altnews.in", "name": "Alt News", "category": "fact_checker"},
@@ -108,6 +108,7 @@
     {"domain": "variety.com", "name": "Variety", "category": "news_outlet"},
     {"domain": "washingtonpost.com", "name": "The Washington Post", "category": "news_outlet"},
     {"domain": "wired.com", "name": "WIRED", "category": "news_outlet"},
-    {"domain": "wsj.com", "name": "The Wall Street Journal", "category": "news_outlet"}
+    {"domain": "wsj.com", "name": "The Wall Street Journal", "category": "news_outlet"},
+    {"domain": "wikipedia.org", "name": "Wikipedia", "category": "reference"}
   ]
 }

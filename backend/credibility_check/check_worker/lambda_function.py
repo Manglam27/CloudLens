@@ -150,11 +150,16 @@ def explain(lines, kind, claim, problem, sources, scored, reason):
     if problem:
         return problem
     if not sources:
-        return "No trusted fact-checks or news reports about this claim were found yet, so the score stays neutral."
+        return "No trusted fact-checks, news reports or reference articles about this claim were found yet."
     if scored["verdict"] not in (TRUE, FALSE) and scored["supporters"] + scored["refuters"]:
         needed = int(os.environ.get("MIN_SOURCES", "2"))
-        reason = (reason + " " if reason else "") + (
-            f"Fewer than {needed} independent trusted sources agree, so the claim stays Unverified.")
+        if scored["balance"] == 50:
+            tail = "The sources disagree, so the claim stays Unverified."
+        else:
+            lean = "true" if scored["balance"] > 50 else "false"
+            tail = (f"The evidence leans {lean}, but a verdict needs {needed} independent trusted sources "
+                    "that agree, or a published fact-check of this claim.")
+        reason = (reason + " " if reason else "") + tail
     return reason
 
 

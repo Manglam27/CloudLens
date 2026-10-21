@@ -5,10 +5,11 @@ Providers:
     google_fact_check  Google Fact Check Tools API (key)  rated fact-checks, the main source
     google_news        Google News RSS (no key)            news and fact-check articles from many outlets
     bing_news          Bing News RSS (no key)              the same from Bing's index, with summaries
+    wikipedia          Wikipedia API (no key)              encyclopedia intros, for settled facts
     newsapi            NewsAPI.org (key, optional)         news limited to trusted domains
     guardian           The Guardian Content API (key, optional)
 
-Each item: {"kind": "fact_check" | "news", "provider", "domain", "publisher",
+Each item: {"kind": "fact_check" | "reference" | "news", "provider", "domain", "publisher",
 "url", "title", "rating", "summary", "claim_reviewed", "weight"}. Articles
 from fact-checking sites, or headlined "Fact check", count as fact-checks.
 """
@@ -24,10 +25,12 @@ from pathlib import Path
 
 TIMEOUT_SECONDS = 8
 FEED_ITEMS = 30  # news feed entries read per search; only trusted ones are kept
-CATEGORY_WEIGHTS = {"fact_checker": 1.0, "wire_service": 1.0, "news_outlet": 0.6}
+WIKI_ARTICLES = 3
+CATEGORY_WEIGHTS = {"fact_checker": 1.0, "wire_service": 1.0, "news_outlet": 0.6, "reference": 0.6}
 NEWS_CATEGORIES = ("wire_service", "news_outlet")
 SEED_FILE = Path(__file__).with_name("trusted_sources.json")
-USER_AGENT = "CloudLens/1.0 (ICSI 499 capstone project)"
+# Wikipedia asks API clients to say who they are.
+USER_AGENT = "CloudLens/1.0 (ICSI 499 capstone project; https://github.com/Manglam27/CloudLens)"
 
 
 class EvidenceError(Exception):
@@ -190,6 +193,11 @@ def guardian(query, key, sources, limit):
 _FACT_CHECK_HEADLINE = re.compile(r"\bfact[ -]?check", re.I)
 
 
+def _feed_queries(query):
+    """News feed searches: the claim's keywords, the same asking for fact-checks, and its core words."""
+    return list(dict.fromkeys([query, f"{query} fact check", short_query(query)]))
+
+
 def _feed_item(provider, url, title, sources, publisher, domain, summary=""):
     """A news feed entry; articles by fact-checkers or headlined "Fact check" count as fact-checks."""
     domain = normalize_domain(domain or url)
@@ -204,7 +212,7 @@ def google_news(query, key, sources, limit):
         return _http_get_xml(f"https://news.google.com/rss/search?{params}")
 
     items = []
-    for root in _run_all(search, [query, f"{query} fact check"]):
+    for root in _run_all(search, _feed_queries(query)):
         for entry in root.findall("./channel/item")[:FEED_ITEMS]:
             source = entry.find("source")
             publisher = (source.text or "") if source is not None else ""
@@ -221,7 +229,7 @@ def bing_news(query, key, sources, limit):
         return _http_get_xml(f"https://www.bing.com/news/search?{params}")
 
     items = []
-    for root in _run_all(search, [query, f"{query} fact check"]):
+    for root in _run_all(search, _feed_queries(query)):
         for entry in root.findall("./channel/item")[:FEED_ITEMS]:
             link = entry.findtext("link", "")
             # Links go through a Bing redirect that carries the article address.
@@ -236,9 +244,55 @@ def bing_news(query, key, sources, limit):
     return items
 
 
+def _name_phrases(claim):
+    """The names in a claim, kept whole: "The capital of Australia is Canberra" ->
+    ["Australia", "Canberra"]; "Joe Biden is president" -> ["Joe Biden"]."""
+    if _names(claim, claim) == "" and claim.split()[1:]:
+        return []  # all-caps or headline-style text: capitals are not names
+    phrases = []
+    for run in re.findall(r"[A-Z][\w'’-]*(?:\s+[A-Z][\w'’-]*)*", claim):
+        words = run.split()
+        while words and words[0] in _HEADLINE_WORDS | {"BREAKING", "NEWS"}:
+            words = words[1:]
+        if words:
+            phrases.append(" ".join(words).removesuffix("'s").removesuffix("’s"))
+    return list(dict.fromkeys(phrases))
+
+
+def wikipedia(queries, key, sources, limit):
+    """The opening paragraphs of the Wikipedia articles about the names in the claim
+    and of the best search matches, for settled facts ("the capital of Australia is
+    Canberra") that news no longer reports. queries: [keywords, claim]."""
+    queries = [queries] if isinstance(queries, str) else list(queries)
+
+    def api(params):
+        params = urllib.parse.urlencode({**params, "format": "json", "formatversion": 2})
+        return _http_get_json(f"https://en.wikipedia.org/w/api.php?{params}").get("query") or {}
+
+    hits = api({"action": "query", "list": "search", "srsearch": queries[0], "srlimit": WIKI_ARTICLES}).get("search", [])
+    # Search ranks side articles ("Second cabinet of Donald Trump") above the main
+    # one, so the articles named in the claim are fetched directly too.
+    named = _name_phrases(queries[-1])[:WIKI_ARTICLES + 1]
+    titles = list(dict.fromkeys([h["title"] for h in hits] + named))
+    if not titles:
+        return []
+    pages = api({"action": "query", "prop": "extracts", "exintro": 1, "explaintext": 1, "exsentences": 6,
+                 "exlimit": "max", "redirects": 1, "titles": "|".join(titles)}).get("pages", [])
+    items = []
+    for page in pages:
+        if not page.get("extract"):
+            continue
+        url = "https://en.wikipedia.org/wiki/" + urllib.parse.quote(page["title"].replace(" ", "_"))
+        item = _item("reference", "wikipedia", url, page["title"], sources, publisher="Wikipedia")
+        item["summary"] = re.sub(r"\s+", " ", page["extract"]).strip()[:1500]
+        items.append(item)
+    return items
+
+
 # (name, search function, needs a key). Google Fact Check is the main source of evidence.
 PROVIDERS = [("google_fact_check", google_fact_check, True), ("google_news", google_news, False),
-             ("bing_news", bing_news, False), ("newsapi", newsapi, True), ("guardian", guardian, True)]
+             ("bing_news", bing_news, False), ("wikipedia", wikipedia, False), ("newsapi", newsapi, True),
+             ("guardian", guardian, True)]
 PRIMARY = "google_fact_check"
 
 
@@ -256,7 +310,7 @@ def find_evidence(query, keys, sources, limit, enabled=None, also_try=()):
             if (enabled is not None and name not in enabled) or (needs_key and not keys.get(name)):
                 report[name] = "skipped"
                 continue
-            queries = [query, *also_try] if name == PRIMARY else query
+            queries = [query, *also_try] if name in (PRIMARY, "wikipedia") else query
             futures[pool.submit(search, queries, keys.get(name), sources, limit)] = name
         found = []
         for future in concurrent.futures.as_completed(futures):
@@ -281,18 +335,32 @@ def find_evidence(query, keys, sources, limit, enabled=None, also_try=()):
                 kept[field] = kept[field] or item[field]
         else:
             unique[key] = item
-    items, names = [], _names(query)
+    claim = also_try[0] if also_try else query
+    items, names = [], _names(query, claim)
     for item in unique.values():
         item["relevance"] = relevance(query, item)
         item["core_relevance"] = relevance(short_query(query), item)
         item["names_found"] = relevance(names, item) if names else 1.0
+        if item["kind"] == "news":
+            # Support is judged on the headline alone: a summary can share the words
+            # without making the claim ("How much coffee is safe to drink?").
+            headline = {"title": item["title"], "summary": "", "claim_reviewed": ""}
+            item["headline_match"] = relevance(query, headline)
+            item["headline_core"] = relevance(short_query(query), headline)
+        if item["kind"] == "reference":
+            _match_sentence(query, claim, names, item)
+        if item["kind"] == "fact_check":
+            item["claim_match"] = claim_match(query, item)
+            # Fact-checks of plainly different claims would only take the places of useful results.
+            if item["claim_match"] >= MIN_CLAIM_MATCH - 0.2:
+                items.append(item)
         # News search matches loosely; skip articles that share few of the claim's words.
-        # Fact-checks get a lower bar: Claude, or the stance rules, decide whether they fit.
-        if item["relevance"] >= (MIN_RELEVANCE / 2 if item["kind"] == "fact_check" else MIN_RELEVANCE):
+        elif item["relevance"] >= MIN_RELEVANCE:
             items.append(item)
     order = {name: i for i, (name, _, _) in enumerate(PROVIDERS)}
-    items.sort(key=lambda i: (i["kind"] != "fact_check", -round(i["relevance"], 1), -i["weight"],
-                              order[i["provider"]]))
+    kinds = {"fact_check": 0, "reference": 1, "news": 2}
+    items.sort(key=lambda i: (kinds[i["kind"]], not i.get("about_subject", False),
+                              -round(i.get("claim_match", i["relevance"]), 1), -i["weight"], order[i["provider"]]))
     # Prefer different sites: a site's second article only gets a slot after every site has one.
     firsts, repeats, sites = [], [], set()
     for item in items:
@@ -333,13 +401,18 @@ def _keywords(text):
             if (len(w) > 2 or w in _SHORT_WORDS or any(c.isdigit() for c in w)) and w not in _COMMON}
 
 
-def _names(query):
+# Small words that only start with a capital in headline-style text ("Took Over a Month To Count").
+_HEADLINE_WORDS = {"A", "An", "And", "As", "At", "For", "From", "In", "Is", "Its", "Of", "On", "Over", "The", "To",
+                   "With"}
+
+
+def _names(query, claim=""):
     """Capitalized words after the first: places, people and organizations ("Ohio", "Stephen Hubbard").
-    Empty for all-caps text, where capitals say nothing."""
-    words = query.split()
-    if query.isupper():
+    Empty for all-caps or headline-style text, where capitals say nothing."""
+    claim = claim or query
+    if claim.isupper() or any(w in _HEADLINE_WORDS for w in claim.split()[1:]):
         return ""
-    return " ".join(w for w in words[1:] if w[:1].isupper())
+    return " ".join(w for w in query.split()[1:] if w[:1].isupper())
 
 
 def relevance(query, item):
@@ -349,6 +422,42 @@ def relevance(query, item):
         return 0.0
     found = _keywords(" ".join((item["title"], item["summary"], item["claim_reviewed"])))
     return len(wanted & found) / len(wanted)
+
+
+def claim_match(query, item):
+    """How alike the claim and the claim a fact-check reviewed are, both ways (0 to 1):
+    the Dice overlap of their keywords. A fact-check of a different claim that only
+    shares a few words with this one ("Canberra protest photo" for "Canberra is the
+    capital") scores low even though it contains them."""
+    wanted = _keywords(query)
+    reviewed = _keywords(item.get("claim_reviewed") or item["title"]) - {"fact", "check"}
+    if not wanted or not reviewed:
+        return 0.0
+    return 2 * len(wanted & reviewed) / (len(wanted) + len(reviewed))
+
+
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
+_PAST = re.compile(r"\b(was|were|served|former|formerly|previously|until)\b", re.I)
+
+
+def _match_sentence(query, claim, names, item):
+    """For an encyclopedia article: the one sentence that best states the claim.
+    Sets item["sentence"], item["relevance"] (that sentence's share of the claim's
+    keywords, read with the article title), item["tense_ok"], which is False when
+    the sentence describes the past ("served as president") but the claim the
+    present, and item["about_subject"]: whether the article is the main one about
+    something the claim names ("Joe Biden", not "Inauguration of Joe Biden")."""
+    item["about_subject"] = bool(_keywords(item["title"])) and _keywords(item["title"]) <= _keywords(claim)
+    best, best_share = "", 0.0
+    for sentence in _SENTENCE_END.split(item["summary"]):
+        candidate = {"title": item["title"], "summary": sentence, "claim_reviewed": ""}
+        if names and relevance(names, candidate) < 0.75:
+            continue  # not about the same people and places
+        share = relevance(query, candidate)
+        if share > best_share:
+            best, best_share = sentence, share
+    item["sentence"], item["relevance"] = best, best_share
+    item["tense_ok"] = bool(_PAST.search(claim)) or not _PAST.search(best)
 
 
 # Rule-based stances, used only when Claude is unavailable. Besides Claude's
@@ -374,17 +483,30 @@ _TITLE_SUPPORTS = re.compile(r"^(fact[ -]?check:?\s*)?(yes|true)\b|\b(is|are|was
 _DOUBT = re.compile(r"\b(false|fake|hoax|debunk\w*|myths?|rumou?rs?|conspirac\w*|misleading|misinformation|"
                     r"disinformation|no evidence|viral|claims?|claimed|alleged\w*|denie[sd]|deny|not|isn't|fact.?check\w*)\b",
                     re.I)
-MIN_FACT_CHECK_RELEVANCE = 0.5
+MIN_CLAIM_MATCH = 0.5  # how alike a fact-check's reviewed claim and this claim must be
+FACT_CHECK_NAMES = 0.75  # share of the claim's names a fact-check must mention
 NEWS_SUPPORT_RELEVANCE = 0.7
 CORE_SUPPORT_RELEVANCE = 0.75  # share of the claim's few most distinctive words
+SHORT_HEADLINE_RELEVANCE = 0.6  # a headline with the core words still needs this much of the claim
+REFERENCE_SUPPORT_RELEVANCE = 0.8  # share of the claim's keywords in one encyclopedia sentence
+_NEGATION = re.compile(r"\b(not|never|no longer)\b", re.I)
 
 
 def fallback_stance(item):
-    """Stance from a fact-check's rating, or from how closely a news story matches the claim."""
+    """Stance from a fact-check's rating, from an encyclopedia sentence that states
+    the claim, or from how closely a news story matches the claim."""
     relevance = item.get("relevance", 1.0)
+    if item["kind"] == "reference":
+        sentence = item.get("sentence", "")
+        if (relevance >= REFERENCE_SUPPORT_RELEVANCE and item.get("about_subject", True)
+                and item.get("tense_ok", True) and not _NEGATION.search(sentence)):
+            return "SUPPORTS"
+        return "RELATED" if relevance >= MIN_RELEVANCE else "UNRELATED"
     if item["kind"] == "fact_check":
         rating = item.get("rating", "")
-        if relevance < MIN_FACT_CHECK_RELEVANCE:
+        # It must review this claim: much the same words both ways, and the same people and
+        # places (a fact-check of another Trump speech is not about "Trump is president").
+        if item.get("claim_match", 1.0) < MIN_CLAIM_MATCH or item.get("names_found", 1.0) < FACT_CHECK_NAMES:
             return "UNRELATED"
         if _MIXED.search(rating):
             return "MIXED"
@@ -402,11 +524,14 @@ def fallback_stance(item):
         return "SUPPORTS" if _TITLE_SUPPORTS.search(finding) else "RELATED"
     # Trusted outlets reporting the same thing as plain news back the claim up.
     # Headlines are short, so a story that has most of the claim's core words counts too.
-    matches = relevance >= NEWS_SUPPORT_RELEVANCE or (
-        relevance >= MIN_RELEVANCE + 0.1 and item.get("core_relevance", 0) >= CORE_SUPPORT_RELEVANCE)
-    # ...and it must be about the same people and places.
+    headline = item.get("headline_match", relevance)
+    matches = headline >= NEWS_SUPPORT_RELEVANCE or (
+        headline >= SHORT_HEADLINE_RELEVANCE
+        and item.get("headline_core", item.get("core_relevance", 0)) >= CORE_SUPPORT_RELEVANCE)
+    # ...and it must be about the same people and places, and state rather than ask.
     same_names = item.get("names_found", 1.0) >= 0.5
-    if matches and same_names and not _DOUBT.search(f"{item['title']} {item['summary']}"):
+    asks = item["title"].rstrip().endswith("?")
+    if matches and same_names and not asks and not _DOUBT.search(f"{item['title']} {item['summary']}"):
         return "SUPPORTS"
     return "RELATED" if relevance >= MIN_RELEVANCE else "UNRELATED"
 

@@ -58,10 +58,10 @@ with no social-media integration.
 3. **Find the claim:** Claude Haiku 4.5 on Amazon Bedrock keeps the checkable
    statement, or returns none for opinions and jokes. Rules that remove names,
    @handles, times and like counts are the fallback.
-4. **Find evidence:** Google Fact Check Tools, Google News, Bing News, NewsAPI
-   and The Guardian are searched in parallel. Only sites in the trusted-source
-   table (108 fact-checkers, wire services and news outlets) count, at most 8
-   results.
+4. **Find evidence:** Google Fact Check Tools, Google News, Bing News,
+   Wikipedia, NewsAPI and The Guardian are searched in parallel. Only sites in
+   the trusted-source table (fact-checkers, wire services, news outlets and
+   Wikipedia, 109 in all) count, at most 8 results.
 5. **Judge the sources:** Claude labels each source Supports, Refutes or
    Unrelated and writes a short reason. Rules that read fact-check ratings and
    headlines are the fallback.
@@ -71,15 +71,18 @@ with no social-media integration.
 ### Credibility score
 
 - Each source has a weight: **1.0** for fact-checkers and wire services, **0.6**
-  for established news outlets. Unknown sites are ignored.
-- **Score = 100 × supporting weight ÷ (supporting + refuting weight)**. A mixed
-  rating ("Half True") counts half each way; with no evidence the score is 50.
-- **True:** score ≥ 70, and at least 2 independent trusted sources support the
-  claim, or one published fact-check of this same claim does.
-- **False:** score ≤ 30, and at least 2 independent trusted sources refute it,
+  for established news outlets and Wikipedia. Unknown sites are ignored.
+- **Balance = 100 × supporting weight ÷ (supporting + refuting weight)**. A mixed
+  rating ("Half True") counts half each way; with no evidence the balance is 50.
+- **True:** balance ≥ 70, and at least 2 independent trusted sources support the
+  claim, or one published fact-check or Wikipedia sentence states it.
+- **False:** balance ≤ 30, and at least 2 independent trusted sources refute it,
   or one published fact-check of this same claim does.
 - **Unverified:** every other case, including too few sources, disagreement,
   opinions, or no evidence.
+- **Score shown:** the balance for True and False, so True is always 70–100 and
+  False 0–30. An Unverified claim is shown between 35 and 65: above 50 the
+  evidence leans true, below 50 it leans false.
 
 The limits 70 and 30 are kept in configuration, so they can be tuned without
 redeploying.
