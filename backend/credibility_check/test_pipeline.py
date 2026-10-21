@@ -154,11 +154,36 @@ class EvidenceTest(unittest.TestCase):
     def test_rating_rules(self):
         cases = {"False": "REFUTES", "Pants on Fire!": "REFUTES", "Mostly False": "REFUTES", "Incorrect": "REFUTES",
                  "Not true": "REFUTES", "True": "SUPPORTS", "Mostly True": "SUPPORTS", "Correct": "SUPPORTS",
-                 "Half True": "UNRELATED", "Missing context": "UNRELATED", "Unproven": "UNRELATED", "": "UNRELATED"}
+                 "Half True": "MIXED", "Missing context": "MIXED", "Unproven": "MIXED", "": "RELATED"}
         for rating, expected in cases.items():
             with self.subTest(rating=rating):
-                self.assertEqual(evidence.rating_stance({"kind": "fact_check", "rating": rating}), expected)
-        self.assertEqual(evidence.rating_stance({"kind": "news", "rating": "False"}), "UNRELATED")
+                self.assertEqual(evidence.fallback_stance({"kind": "fact_check", "rating": rating}), expected)
+        off_topic = {"kind": "fact_check", "rating": "False", "relevance": 0.1}
+        self.assertEqual(evidence.fallback_stance(off_topic), "UNRELATED")
+
+    def test_news_stance_from_how_closely_it_matches(self):
+        def news(title, summary=""):
+            item = {"kind": "news", "title": title, "summary": summary, "claim_reviewed": "", "rating": ""}
+            item["relevance"] = evidence.relevance("Colorado first winter weather advisory snow", item)
+            return evidence.fallback_stance(item)
+
+        self.assertEqual(news("Colorado's first winter weather advisory brings snow"), "SUPPORTS")
+        self.assertEqual(news("Viral claim about Colorado's first winter weather advisory and snow"), "RELATED")
+        self.assertEqual(news("Colorado weather: snow on the way"), "RELATED")
+        self.assertEqual(news("Sydney airport incidents investigated"), "UNRELATED")
+
+    def test_relevance_ignores_case_plurals_and_possessives(self):
+        item = {"title": "California's ballot count", "summary": "", "claim_reviewed": ""}
+        self.assertEqual(evidence.relevance("California ballots", item), 1.0)
+        self.assertEqual(evidence.relevance("Florida ballots", item), 0.5)
+
+    def test_off_topic_news_is_dropped(self):
+        self.web.responses = {"content.guardianapis.com": {"response": {"status": "ok", "results": [
+            {"webUrl": "https://www.theguardian.com/a", "webTitle": "Sydney airport incidents investigated"},
+            {"webUrl": "https://www.theguardian.com/b", "webTitle": "California ballot count takes a month"}]}}}
+        items, _ = evidence.find_evidence("California ballot count month", {"guardian": "K"}, seed_sources(), 5,
+                                          enabled=["guardian"])
+        self.assertEqual([i["url"] for i in items], ["https://www.theguardian.com/b"])
 
 
 class JudgeTest(unittest.TestCase):
@@ -244,6 +269,7 @@ class PipelineTest(unittest.TestCase):
     def test_opinions_are_not_searched(self):
         item = self.run_check(FakeClaude(claim={"kind": "opinion", "claim": "", "search_query": ""}))
         self.assertIn("opinion", item["reason"])
+        self.assertIsNone(item["score"])  # nothing to score
         self.assertEqual(self.web.calls, [])
         self.assertIn(("h",), self.cache.items)
 
@@ -282,6 +308,25 @@ class PipelineTest(unittest.TestCase):
                                "weight": 1.0, "enabled": True})
         item = self.run_check(FakeClaude())
         self.assertIn("randomblog.net", [s["domain"] for s in item["sources"]])
+
+    def test_no_evidence_gives_a_neutral_score(self):
+        self.web.responses = {"factchecktools": {}}
+        item = self.run_check(FakeClaude())
+        self.assertEqual((item["verdict"], item["score"], item["sources"]), ("UNVERIFIED", 50, []))
+        self.assertIn("neutral", item["reason"])
+
+    def test_without_claude_matching_news_counts_and_off_topic_is_hidden(self):
+        worker._ssm = FakeSSM({GOOGLE_PARAM: "GKEY", NEWSAPI_PARAM: "NKEY"})
+        self.web.responses = {"factchecktools": {}, "newsapi.org": {"status": "ok", "articles": [
+            {"source": {"name": "AP"}, "url": "https://apnews.com/a",
+             "title": "Two cups of coffee a day cures the flu, study finds"},
+            {"source": {"name": "Reuters"}, "url": "https://www.reuters.com/b",
+             "title": "Drinking coffee cures flu, doctors report", "description": "Two cups a day."},
+            {"source": {"name": "BBC"}, "url": "https://www.bbc.com/c", "title": "Flu season starts early"}]}}
+        item = self.run_check(FakeClaude(claim_stop="max_tokens", judge_stop="max_tokens"))
+        self.assertEqual([s["stance"] for s in item["sources"]], ["SUPPORTS", "SUPPORTS"])
+        self.assertEqual((item["verdict"], item["score"]), ("TRUE", 100))
+        self.assertEqual(item["reason"], "2 trusted sources back up this claim.")
 
     def test_stages_still_run_in_order(self):
         self.run_check(FakeClaude())

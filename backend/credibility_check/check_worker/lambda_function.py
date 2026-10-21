@@ -151,8 +151,8 @@ def explain(lines, kind, claim, problem, sources, scored, reason):
     if problem:
         return problem
     if not sources:
-        return "No trusted fact-checks or news reports were found for this claim yet."
-    if scored["verdict"] not in (TRUE, FALSE):
+        return "No trusted fact-checks or news reports about this claim were found yet, so the score stays neutral."
+    if scored["verdict"] not in (TRUE, FALSE) and scored["supporters"] + scored["refuters"]:
         reason = (reason + " " if reason else "") + (
             "Fewer than 2 independent trusted sources agree, so the claim stays Unverified.")
     return reason
@@ -198,19 +198,22 @@ def lambda_handler(event, context):
                 stances, reason = llm.judge_sources(claim, sources)
             except llm.LLMError:
                 traceback.print_exc()
-                stances = [evidence.rating_stance(s) for s in sources]
+                stances = [evidence.fallback_stance(s) for s in sources]
                 reason, complete = evidence.summarize(sources, stances), False
         scored = score_evidence(
             [{"domain": s["domain"], "weight": s["weight"], "stance": st} for s, st in zip(sources, stances)],
             int(os.environ.get("T_TRUE", "70")), int(os.environ.get("T_FALSE", "30")))
+        # Off-topic search results are not shown.
+        shown = [(s, st) for s, st in zip(sources, stances) if st != "UNRELATED"]
+        checked = bool(claim) and kind == "claim" and not problem
         result = {
             "verdict": scored["verdict"],
-            "score": scored["score"],
-            "reason": explain(lines, kind, claim, problem, sources, scored, reason),
+            "score": scored["score"] if checked else None,
+            "reason": explain(lines, kind, claim, problem, [s for s, _ in shown], scored, reason),
             "claim": claim,
             "sources": [{"kind": s["kind"], "publisher": s["publisher"], "domain": s["domain"], "url": s["url"],
                          "title": s["title"], "rating": s["rating"], "stance": st}
-                        for s, st in zip(sources, stances)],
+                        for s, st in shown],
         }
         _update(key, **result, kind=kind, providers=report, ocrText="\n".join(lines)[:MAX_OCR_CHARS],
                 status="DONE", finishedAt=_now())

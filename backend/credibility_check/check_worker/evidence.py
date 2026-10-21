@@ -172,40 +172,87 @@ def find_evidence(query, keys, sources, limit, enabled=None):
     for item in found:
         if item["url"] and item["url"] not in seen and item["weight"] > 0:
             seen.add(item["url"])
-            items.append(item)
+            item["relevance"] = relevance(query, item)
+            # News search matches loosely; skip articles that share few of the claim's words.
+            if item["kind"] == "fact_check" or item["relevance"] >= MIN_RELEVANCE:
+                items.append(item)
     order = {name: i for i, (name, _, _) in enumerate(PROVIDERS)}
-    items.sort(key=lambda i: (i["kind"] != "fact_check", -i["weight"], order[i["provider"]]))
+    items.sort(key=lambda i: (i["kind"] != "fact_check", -round(i["relevance"], 1), -i["weight"],
+                              order[i["provider"]]))
     return items[:limit], report
 
 
-# Rule-based stance for fact-checks, used only when Claude is unavailable.
+MIN_RELEVANCE = 0.4
+_WORD = re.compile(r"[a-z0-9%$]+")
+_COMMON = frozenset("the and for with that this are was were has have had from but not you its our their".split())
+
+
+def _keywords(text):
+    words = _WORD.findall(re.sub(r"['’]s\b", "", (text or "").lower()))
+    # Crude stemming so "ballots" matches "ballot".
+    return {w[:-1] if len(w) > 3 and w.endswith("s") else w
+            for w in words if (len(w) > 2 or w.isdigit()) and w not in _COMMON}
+
+
+def relevance(query, item):
+    """Share of the query's keywords that appear in the item (0 to 1)."""
+    wanted = _keywords(query)
+    if not wanted:
+        return 0.0
+    found = _keywords(" ".join((item["title"], item["summary"], item["claim_reviewed"])))
+    return len(wanted & found) / len(wanted)
+
+
+# Rule-based stances, used only when Claude is unavailable. Besides Claude's
+# SUPPORTS / REFUTES / UNRELATED they use MIXED (a fact-check with an in-between
+# rating) and RELATED (on topic, but no clear side). Only SUPPORTS and REFUTES count.
 _MIXED = re.compile(r"half|mix|partly|partially|unproven|unverified|missing context|lacks context|satire|outdated|"
                     r"no evidence either|disputed", re.I)
 _REFUTES = re.compile(r"false|fake|pants on fire|incorrect|inaccurate|misleading|fabricated|hoax|scam|not true|"
                       r"wrong|debunk|baseless|no evidence|altered|manipulated|doctored|untrue|myth", re.I)
 _SUPPORTS = re.compile(r"\btrue\b|correct|accurate|confirmed|\breal\b|legit", re.I)
+# Words that mean a news story questions the claim instead of reporting it as fact.
+_DOUBT = re.compile(r"\b(false|fake|hoax|debunk\w*|myths?|rumou?rs?|conspirac\w*|misleading|misinformation|"
+                    r"disinformation|no evidence|viral|claims?|claimed|alleged\w*|denie[sd]|deny|not|isn't|fact.?check\w*)\b",
+                    re.I)
+MIN_FACT_CHECK_RELEVANCE = 0.25
+NEWS_SUPPORT_RELEVANCE = 0.7
 
 
-def rating_stance(item):
-    """SUPPORTS / REFUTES / UNRELATED from a fact-check's own rating; news items are UNRELATED."""
-    rating = item.get("rating", "") if item.get("kind") == "fact_check" else ""
-    if not rating or _MIXED.search(rating):
-        return "UNRELATED"
-    if _REFUTES.search(rating):
-        return "REFUTES"
-    if _SUPPORTS.search(rating):
+def fallback_stance(item):
+    """Stance from a fact-check's rating, or from how closely a news story matches the claim."""
+    relevance = item.get("relevance", 1.0)
+    if item["kind"] == "fact_check":
+        rating = item.get("rating", "")
+        if relevance < MIN_FACT_CHECK_RELEVANCE:
+            return "UNRELATED"
+        if not rating:
+            return "RELATED"
+        if _MIXED.search(rating):
+            return "MIXED"
+        if _REFUTES.search(rating):
+            return "REFUTES"
+        if _SUPPORTS.search(rating):
+            return "SUPPORTS"
+        return "RELATED"
+    # Trusted outlets reporting the same thing as plain news back the claim up.
+    if relevance >= NEWS_SUPPORT_RELEVANCE and not _DOUBT.search(f"{item['title']} {item['summary']}"):
         return "SUPPORTS"
-    return "UNRELATED"
+    return "RELATED" if relevance >= MIN_RELEVANCE else "UNRELATED"
 
 
 def summarize(items, stances):
     """A plain one-line reason when Claude is unavailable."""
     refutes = sum(1 for s in stances if s == "REFUTES")
     supports = sum(1 for s in stances if s == "SUPPORTS")
-    if refutes and not supports:
-        return f"{refutes} trusted fact-check{'s' if refutes > 1 else ''} rated this claim false or misleading."
-    if supports and not refutes:
-        return f"{supports} trusted source{'s' if supports > 1 else ''} rated this claim true."
+    others = sum(1 for s in stances if s in ("MIXED", "RELATED"))
     if supports and refutes:
         return "Trusted sources disagree about this claim."
-    return "The trusted sources found do not clearly rate this claim."
+    if refutes:
+        return f"{refutes} trusted fact-check{'s' if refutes > 1 else ''} rated this claim false or misleading."
+    if supports:
+        return f"{supports} trusted source{'s' if supports > 1 else ''} back{'' if supports > 1 else 's'} up this claim."
+    if others:
+        return (f"{others} trusted source{'s' if others > 1 else ''} discuss{'' if others > 1 else 'es'} this topic "
+                f"but {'do' if others > 1 else 'does'} not clearly confirm or refute the claim.")
+    return ""

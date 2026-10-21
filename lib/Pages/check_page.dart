@@ -195,6 +195,15 @@ class _CheckPageState extends State<CheckPage> {
             color: Verdict.color(check.verdict),
             backgroundColor: Colors.grey.shade300,
           ),
+          const SizedBox(height: 4),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text('0 · False', style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
+              Text('50 · No evidence either way', style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
+              Text('100 · True', style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
+            ],
+          ),
         ],
         const SizedBox(height: 24),
         if (check.claim != null) ...[
@@ -225,6 +234,8 @@ class _CheckPageState extends State<CheckPage> {
     final (label, color) = switch (source.stance) {
       'SUPPORTS' => ('Supports', Colors.green.shade700),
       'REFUTES' => ('Refutes', Colors.red.shade700),
+      'MIXED' => ('Mixed', Colors.orange.shade800),
+      'RELATED' => ('Related', Colors.blueGrey.shade600),
       _ => ('Unrelated', Colors.grey.shade600),
     };
     return Card(

@@ -2,8 +2,8 @@
 
 Rule-based first step (M4, step 2). OCR of a social-media screenshot mixes the
 post with interface text: names, @handles, timestamps and like counts. These
-rules drop that noise and keep the longest full sentence. A later step adds
-one LLM call to tell claims apart from opinions and jokes.
+rules drop that noise and keep the first full sentence of the post. A later
+step adds one LLM call to tell claims apart from opinions and jokes.
 """
 
 import re
@@ -38,13 +38,17 @@ def is_noise(line):
 def clean_lines(lines):
     """Drops interface text and short labels such as display names."""
     lines = [line.strip() for line in lines]
-    kept = []
+    # Above the first "@handle" header there is only app or browser chrome and the
+    # poster's name, unless a full sentence shows up first.
     for i, line in enumerate(lines):
+        if re.search(r"[.!?]$", line):
+            break
+        if line.startswith("@") and is_noise(line):
+            lines = lines[i + 1:]
+            break
+    kept = []
+    for line in lines:
         if not line or is_noise(line):
-            continue
-        # The line above an "@handle · 2h" header is the poster's display name.
-        after = lines[i + 1] if i + 1 < len(lines) else ""
-        if after.startswith("@") and is_noise(after) and not re.search(r"[.!?]$", line):
             continue
         # Short lines without sentence punctuation are names, labels or buttons.
         if len(line.split()) < 3 and not re.search(r"[.!?]$", line):
@@ -53,14 +57,23 @@ def clean_lines(lines):
     return kept
 
 
+# Page footers and captions: "Published on Instagram 19 Aug 2026 at 5:00 AM", "8 hours ago".
+_TIMESTAMP = re.compile(r"\b(" + _DATE + r"|\d{1,2}\s+" + _MONTHS + r"|\d{1,2}:\d{2}|published|posted|updated|ago)\b", re.I)
+
+
 def find_claim(lines):
-    """Returns the claim to check, or None when there is no full sentence."""
+    """Returns the claim to check, or None when there is no full sentence.
+
+    A post leads with its claim, before commentary, replies and page footers,
+    so this takes the first full sentence that is not a caption or a fragment.
+    """
     text = " ".join(clean_lines(lines))
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
     candidates = [s for s in sentences if len(s.split()) >= MIN_CLAIM_WORDS]
     if not candidates:
         return None
-    return max(candidates, key=len)[:MAX_CLAIM_CHARS]
+    clean = [s for s in candidates if not _TIMESTAMP.search(s) and not s[0].islower()]
+    return (clean or candidates)[0][:MAX_CLAIM_CHARS]
 
 
 MAX_QUERY_WORDS = 8
