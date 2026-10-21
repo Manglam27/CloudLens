@@ -1,0 +1,16 @@
+{
+  "_comment": "Team-maintained trusted-source list (Milestone 2 slide 7). Fact-checkers and wire services weigh 1.0, established news outlets 0.6; any other site weighs 0 and is ignored. Subdomains match their parent (factcheck.afp.com matches afp.com).",
+  "fact_checkers_and_wire_services": [
+    "snopes.com", "politifact.com", "factcheck.org", "fullfact.org", "leadstories.com",
+    "checkyourfact.com", "healthfeedback.org", "sciencefeedback.co", "climatefeedback.org",
+    "africacheck.org", "boomlive.in", "altnews.in", "factly.in", "newschecker.in",
+    "vishvasnews.com", "correctiv.org", "maldita.es", "newtral.es", "teyit.org",
+    "logicallyfacts.com", "misbar.com", "dpa-factchecking.com", "aap.com.au",
+    "apnews.com", "reuters.com", "afp.com"
+  ],
+  "established_news": [
+    "usatoday.com", "washingtonpost.com", "nytimes.com", "bbc.com", "bbc.co.uk", "npr.org",
+    "cnn.com", "nbcnews.com", "cbsnews.com", "abcnews.go.com", "theguardian.com", "wsj.com",
+    "bloomberg.com", "pbs.org", "latimes.com", "cbc.ca", "abc.net.au", "aljazeera.com"
+  ]
+}

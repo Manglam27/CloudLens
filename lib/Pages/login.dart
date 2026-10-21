@@ -1,5 +1,6 @@
 import 'package:cloud_lens/Pages/confirm_signup.dart';
 import 'package:cloud_lens/Pages/main_page.dart';
+import 'package:cloud_lens/Pages/reset_password.dart';
 import 'package:cloud_lens/Pages/signup.dart';
 import 'package:amplify_auth_cognito/amplify_auth_cognito.dart';
 import 'package:amplify_flutter/amplify_flutter.dart';
@@ -98,6 +99,18 @@ class _LoginPageState extends State<LoginPage> {
         const SnackBar(content: Text("Please enter both email and password")),
       );
     }
+  }
+
+  /// Opens the reset flow (FR 1.2); on success it returns the e-mail to sign in with.
+  Future<void> openResetPassword() async {
+    final email = await Navigator.push<String>(
+      context,
+      MaterialPageRoute(builder: (context) => ResetPasswordPage(initialEmail: emailController.text.trim())),
+    );
+    if (email == null || !mounted) return;
+    emailController.text = email;
+    passwordController.clear();
+    showErrorSnackBar('Password changed. Log in with your new password.');
   }
 
   void navigateToSignUpPage() {
@@ -216,7 +229,14 @@ class _LoginPageState extends State<LoginPage> {
                       style: TextStyle(fontSize: 16.0, fontWeight: FontWeight.bold),
                     ),
                   ),
-                  const SizedBox(height: 15.0),
+                  TextButton(
+                    onPressed: openResetPassword,
+                    child: const Text(
+                      'Forgot password?',
+                      style: TextStyle(color: Colors.deepPurple, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  const SizedBox(height: 5.0),
                   // Divider
                   Row(
                     children: [

@@ -101,6 +101,7 @@ class WorkerTest(unittest.TestCase):
         self.checks.put_item({"userId": USER, "checkId": CHECK, "imageKey": f"{USER}_a.jpg", "imageHash": "h",
                               "status": "QUEUED"})
         worker._tables = {"checks": self.checks, "cache": self.cache}
+        worker.llm._client = None  # no Claude here: these tests cover the rule-based fallback
 
     def run_with(self, textract):
         worker._textract = textract

@@ -32,7 +32,10 @@ CHECKS_TABLE = "CloudLensChecks"
 CACHE_TABLE = "CloudLensResultCache"
 API_FN, WORKER_FN = "cloudlens-check-api", "cloudlens-check-worker"
 AUTHORIZER = "cloudlens-cognito"
-MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"  # Claude Haiku 4.5, US inference profile
+# SecureString holding the Google Fact Check Tools API key. Created by a team member, never stored in code:
+#   aws ssm put-parameter --name /cloudlens/google-factcheck-api-key --type SecureString --value <key>
+FACTCHECK_KEY_PARAM = "/cloudlens/google-factcheck-api-key"
 ROUTES = ["POST /checks", "GET /checks", "GET /checks/{checkId}"]
 
 AWS = shutil.which("aws") or str(Path.home() / "AppData/Local/Programs/Amazon/AWSCLIV2/aws.exe")
@@ -188,13 +191,19 @@ def main():
         {"Effect": "Allow", "Action": ["dynamodb:PutItem"], "Resource": table(CACHE_TABLE)},
         {"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": photos},
         {"Effect": "Allow", "Action": ["textract:DetectDocumentText"], "Resource": "*"},
+        # Claude on Bedrock: the US inference profile, plus the model in each region it routes to.
+        {"Effect": "Allow", "Action": ["bedrock:InvokeModel"], "Resource": [
+            f"arn:aws:bedrock:{REGION}:{account}:inference-profile/{MODEL_ID}",
+            f"arn:aws:bedrock:*::foundation-model/{MODEL_ID.removeprefix('us.')}"]},
+        {"Effect": "Allow", "Action": ["ssm:GetParameter"],
+         "Resource": f"arn:aws:ssm:{REGION}:{account}:parameter{FACTCHECK_KEY_PARAM}"},
     ])
 
     print("Lambda")
     common = {"CHECKS_TABLE": CHECKS_TABLE, "CACHE_TABLE": CACHE_TABLE, "BUCKET_NAME": BUCKET}
     ensure_function(WORKER_FN, worker_role, HERE / "dist" / "check_worker.zip",
-                    {**common, "T_TRUE": "70", "T_FALSE": "30", "MAX_RESULTS": "5", "EVIDENCE_ENABLED": "false",
-                     "MODEL_ID": MODEL_ID}, timeout=60, memory=512)
+                    {**common, "T_TRUE": "70", "T_FALSE": "30", "MAX_RESULTS": "5", "EVIDENCE_ENABLED": "true",
+                     "MODEL_ID": MODEL_ID, "FACTCHECK_KEY_PARAM": FACTCHECK_KEY_PARAM}, timeout=60, memory=512)
     ensure_function(API_FN, api_role, HERE / "dist" / "check_api.zip",
                     {**common, "WORKER_FUNCTION": WORKER_FN}, timeout=10, memory=256)
 
