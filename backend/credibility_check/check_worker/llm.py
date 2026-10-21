@@ -98,16 +98,20 @@ def extract_claim(lines):
     return result
 
 
-JUDGE_SYSTEM = """You compare a claim with published fact-checks. Each fact-check has the claim it reviewed, its \
-title and its rating. Judge only from these fields, not from your own knowledge.
+JUDGE_SYSTEM = """You compare a claim with sources found for it. There are two kinds of source:
+- a fact-check, with the claim it reviewed, its title and its rating;
+- a news article, with its headline and a short summary.
+Judge only from these fields, not from your own knowledge.
 
-For each numbered fact-check, decide its stance toward the claim:
-- SUPPORTS: it reviews the same claim and rates it true, mostly true, or correct.
-- REFUTES: it reviews the same claim and rates it false, mostly false, fabricated, or misleading.
-- UNRELATED: it reviews a different claim, or its rating is mixed or unclear (for example half true, unproven, \
-or missing context).
+For each numbered source, decide its stance toward the claim:
+- SUPPORTS: a fact-check of the same claim that rates it true, mostly true, or correct; or a news article that \
+reports the claim as established fact.
+- REFUTES: a fact-check of the same claim that rates it false, mostly false, fabricated, or misleading; or a news \
+article that reports the claim as false or debunked.
+- UNRELATED: a source about a different claim, a mixed or unclear rating (for example half true, unproven, or \
+missing context), or a news article that only mentions the topic without confirming or denying the claim.
 
-Then write one short, plain sentence for a general audience that summarizes what the fact-checks found, such as \
+Then write one short, plain sentence for a general audience that summarizes what the sources found, such as \
 "Two fact-checkers rated this claim false." Do not give a final verdict or a score."""
 
 JUDGE_SCHEMA = {
@@ -134,12 +138,15 @@ JUDGE_SCHEMA = {
 
 def judge_sources(claim, sources):
     """Returns ([stance for each source, in order], reason). Missing indexes count as UNRELATED."""
-    listing = "\n\n".join(
-        f"[{i}] {s['publisher']} ({s['domain']})\n"
-        f"Claim reviewed: {s['claim_reviewed']}\nTitle: {s['title']}\nRating: {s['rating']}"
-        for i, s in enumerate(sources, start=1)
-    )
-    user = f"<claim>\n{claim}\n</claim>\n\n<fact_checks>\n{listing}\n</fact_checks>"
+    def describe(i, s):
+        if s.get("kind", "fact_check") == "fact_check":
+            return (f"[{i}] Fact-check by {s['publisher']} ({s['domain']})\n"
+                    f"Claim reviewed: {s['claim_reviewed']}\nTitle: {s['title']}\nRating: {s['rating']}")
+        return (f"[{i}] News article from {s['publisher']} ({s['domain']})\n"
+                f"Headline: {s['title']}\nSummary: {s.get('summary') or '(none)'}")
+
+    listing = "\n\n".join(describe(i, s) for i, s in enumerate(sources, start=1))
+    user = f"<claim>\n{claim}\n</claim>\n\n<sources>\n{listing}\n</sources>"
     result = _ask(JUDGE_SYSTEM, user, JUDGE_SCHEMA, max_tokens=1024)
     by_index = {}
     for item in result.get("stances", []):

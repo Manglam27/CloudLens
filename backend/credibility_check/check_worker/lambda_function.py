@@ -10,19 +10,24 @@ Pipeline:
     1 read text    Amazon Textract
     2 find claim   Claude finds the claim, or says it is an opinion, satire or
                    nothing to check; the rules in claim.py are the fallback
-    3 evidence     Google Fact Check Tools API, trusted publishers only
-    4 judge        Claude labels each fact-check Supports, Refutes or Unrelated
+    3 evidence     Google Fact Check, NewsAPI, The Guardian and GDELT in
+                   parallel, trusted sources only (CloudLensTrustedSources table)
+    4 judge        Claude labels each source Supports, Refutes or Unrelated;
+                   without Claude, fact-check ratings are read by rules
     5 score        Milestone 2 formula and verdict rules (scoring.py)
 
 Configuration (Lambda environment variables):
-    CHECKS_TABLE, CACHE_TABLE, BUCKET_NAME
+    CHECKS_TABLE, CACHE_TABLE, SOURCES_TABLE, BUCKET_NAME
     T_TRUE=70, T_FALSE=30, MAX_RESULTS=5   verdict limits and result budget
     EVIDENCE_ENABLED=true                  turns steps 3 and 4 on
+    GDELT_ENABLED=true                     the keyless GDELT provider
     MODEL_ID                               Bedrock model, default Claude Haiku 4.5
-    FACTCHECK_KEY_PARAM                    SSM SecureString holding the Google API key
+    FACTCHECK_KEY_PARAM, NEWSAPI_KEY_PARAM, GUARDIAN_KEY_PARAM
+                                           SSM SecureStrings holding provider API keys
 """
 
 import os
+import time
 import traceback
 from datetime import datetime, timezone
 
@@ -32,10 +37,14 @@ import llm
 from scoring import FALSE, TRUE, score_evidence
 
 MAX_OCR_CHARS = 4000
+SOURCES_TTL_SECONDS = 300
+KEY_PARAMS = {"google_fact_check": "FACTCHECK_KEY_PARAM", "newsapi": "NEWSAPI_KEY_PARAM",
+              "guardian": "GUARDIAN_KEY_PARAM"}
 
 _textract = None
 _ssm = None
-_api_key = None
+_keys = {}
+_sources = None  # (loaded_at, TrustedSources)
 _tables = {}
 
 
@@ -70,25 +79,45 @@ def _update(key, **fields):
     )
 
 
-def _fact_check_key():
-    """The Google API key from SSM, or "" when it has not been set up yet."""
-    global _ssm, _api_key
-    if _api_key:
-        return _api_key
-    name = os.environ.get("FACTCHECK_KEY_PARAM")
-    if not name:
-        return ""
-    if _ssm is None:
-        import boto3
-        _ssm = boto3.client("ssm")
+def _api_keys():
+    """Provider API keys from SSM. A missing key is retried on the next check, so adding one needs no redeploy."""
+    global _ssm
+    for provider, env_name in KEY_PARAMS.items():
+        name = os.environ.get(env_name)
+        if _keys.get(provider) or not name:
+            continue
+        if _ssm is None:
+            import boto3
+            _ssm = boto3.client("ssm")
+        try:
+            _keys[provider] = _ssm.get_parameter(Name=name, WithDecryption=True)["Parameter"]["Value"]
+        except Exception as e:
+            code = (getattr(e, "response", None) or {}).get("Error", {}).get("Code")
+            if code != "ParameterNotFound":
+                print(f"could not read {name}: {code or type(e).__name__}")
+    return dict(_keys)
+
+
+def _trusted_sources():
+    """The CloudLensTrustedSources table, refreshed every 5 minutes; the bundled list if it can't be read."""
+    global _sources
+    if _sources and time.time() - _sources[0] < SOURCES_TTL_SECONDS:
+        return _sources[1]
+    by_domain = {}
     try:
-        _api_key = _ssm.get_parameter(Name=name, WithDecryption=True)["Parameter"]["Value"]
-    except Exception as e:
-        code = (getattr(e, "response", None) or {}).get("Error", {}).get("Code")
-        if code != "ParameterNotFound":
-            raise
-        return ""  # not cached, so adding the key later works without a redeploy
-    return _api_key
+        table, kwargs = _table("SOURCES_TABLE"), {}
+        while True:
+            page = table.scan(**kwargs)
+            by_domain.update({item["domain"]: item for item in page.get("Items", [])})
+            if "LastEvaluatedKey" not in page:
+                break
+            kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+    except Exception:
+        traceback.print_exc()
+    if not by_domain:
+        by_domain = evidence.load_seed()
+    _sources = (time.time(), evidence.TrustedSources(by_domain))
+    return _sources[1]
 
 
 def read_text(bucket, key):
@@ -109,7 +138,7 @@ def find_claim(lines):
         return ("claim" if claim else "no_claim"), claim, claim or "", False
 
 
-def explain(lines, kind, claim, problem, scored, claude_reason):
+def explain(lines, kind, claim, problem, sources, scored, reason):
     if not lines:
         return "No readable text was found in this image."
     if kind == "opinion":
@@ -120,9 +149,8 @@ def explain(lines, kind, claim, problem, scored, claude_reason):
         return "No checkable statement was found in the text."
     if problem:
         return problem
-    if scored["supporters"] + scored["refuters"] == 0 and not claude_reason:
-        return "No trusted fact-checks were found for this claim yet."
-    reason = claude_reason or ""
+    if not sources:
+        return "No trusted fact-checks or news reports were found for this claim yet."
     if scored["verdict"] not in (TRUE, FALSE):
         reason = (reason + " " if reason else "") + (
             "Fewer than 2 independent trusted sources agree, so the claim stays Unverified.")
@@ -136,6 +164,7 @@ def lambda_handler(event, context):
         print(f"check not found: {key}")
         return
     evidence_enabled = os.environ.get("EVIDENCE_ENABLED", "false").lower() == "true"
+    gdelt_enabled = os.environ.get("GDELT_ENABLED", "true").lower() == "true"
     max_results = int(os.environ.get("MAX_RESULTS", "5"))
     try:
         _update(key, status="READING_TEXT")
@@ -147,41 +176,43 @@ def lambda_handler(event, context):
         complete = used_claude
 
         _update(key, status="SEARCHING_SOURCES")
-        sources, problem = [], None
+        sources, problem, report = [], None, {}
         if claim and kind == "claim":
             if not evidence_enabled:
                 problem, complete = "Evidence search is not enabled yet, so this claim cannot be verified.", False
-            elif not (api_key := _fact_check_key()):
-                problem, complete = "Evidence search is not configured yet, so this claim cannot be verified.", False
             else:
-                try:
-                    sources = evidence.search_fact_checks(query, api_key, max_results)
-                except evidence.EvidenceError:
-                    traceback.print_exc()
-                    problem, complete = "The fact-check search could not be completed. Please try again.", False
+                enabled = [name for name, _, _ in evidence.PROVIDERS if name != "gdelt" or gdelt_enabled]
+                sources, report = evidence.find_evidence(query, _api_keys(), _trusted_sources(), max_results, enabled)
+                if report.get(evidence.PRIMARY) != "ok":
+                    complete = False  # the main fact-check source was missing or failed
+                    if not sources and report.get(evidence.PRIMARY) == "skipped":
+                        problem = "Fact-check search is not configured yet, so this claim cannot be verified."
+                    elif not sources:
+                        problem = "The fact-check search could not be completed. Please try again."
 
         _update(key, status="SCORING")
-        stances, claude_reason = [], ""
+        stances, reason = [], ""
         if sources:
             try:
-                stances, claude_reason = llm.judge_sources(claim, sources)
+                stances, reason = llm.judge_sources(claim, sources)
             except llm.LLMError:
                 traceback.print_exc()
-                stances = ["UNRELATED"] * len(sources)
-                problem, complete = "The sources could not be compared with the claim. Please try again.", False
+                stances = [evidence.rating_stance(s) for s in sources]
+                reason, complete = evidence.summarize(sources, stances), False
         scored = score_evidence(
             [{"domain": s["domain"], "weight": s["weight"], "stance": st} for s, st in zip(sources, stances)],
             int(os.environ.get("T_TRUE", "70")), int(os.environ.get("T_FALSE", "30")))
         result = {
             "verdict": scored["verdict"],
             "score": scored["score"],
-            "reason": explain(lines, kind, claim, problem, scored, claude_reason),
+            "reason": explain(lines, kind, claim, problem, sources, scored, reason),
             "claim": claim,
-            "sources": [{"publisher": s["publisher"], "domain": s["domain"], "url": s["url"], "title": s["title"],
-                         "rating": s["rating"], "stance": st} for s, st in zip(sources, stances)],
+            "sources": [{"kind": s["kind"], "publisher": s["publisher"], "domain": s["domain"], "url": s["url"],
+                         "title": s["title"], "rating": s["rating"], "stance": st}
+                        for s, st in zip(sources, stances)],
         }
-        _update(key, **result, kind=kind, ocrText="\n".join(lines)[:MAX_OCR_CHARS], status="DONE",
-                finishedAt=_now())
+        _update(key, **result, kind=kind, providers=report, ocrText="\n".join(lines)[:MAX_OCR_CHARS],
+                status="DONE", finishedAt=_now())
         if complete:
             _table("CACHE_TABLE").put_item(Item={"imageHash": item["imageHash"], **result})
     except Exception:
