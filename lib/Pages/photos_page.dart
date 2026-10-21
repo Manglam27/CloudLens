@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:amplify_flutter/amplify_flutter.dart';
@@ -6,6 +7,15 @@ import 'package:uuid/uuid.dart';
 import 'package:cloud_lens/Pages/check_page.dart';
 import 'package:cloud_lens/Pages/editing_page.dart';
 import 'package:cloud_lens/database.dart'; // For DBHelper.insertFavorite
+
+/// A photo in the user's cloud library: its S3 path and a signed link to it.
+/// Signed links change every time they are made, so the path is the cache key.
+class CloudPhoto {
+  final String path;
+  final String url;
+
+  const CloudPhoto(this.path, this.url);
+}
 
 class PhotosPage extends StatefulWidget {
   const PhotosPage({super.key});
@@ -17,7 +27,8 @@ class PhotosPage extends StatefulWidget {
 class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateMixin {
   final _picker = ImagePicker();
   File? _selectedImage;
-  List<String> _cloudImageURLs = [];
+  List<CloudPhoto> _cloudPhotos = [];
+  bool _cloudLoading = true;
   List<File> _localImages = [];
 
   late TabController _tabController;
@@ -199,31 +210,27 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
       final epoch = DateTime.fromMillisecondsSinceEpoch(0);
       filteredFiles.sort((a, b) => (a.lastModified ?? epoch).compareTo(b.lastModified ?? epoch));
 
-      final List<String> imageUrls = [];
-      for (var file in filteredFiles) {
-        final urlOperation = await Amplify.Storage.getUrl(path: StoragePath.fromString(file.path));
-        final urlResult = await urlOperation.result;
-        imageUrls.add(urlResult.url.toString());
-      }
+      // Sign every link at once instead of one after another.
+      final photos = await Future.wait(filteredFiles.map((file) async {
+        final urlResult = await Amplify.Storage.getUrl(path: StoragePath.fromString(file.path)).result;
+        return CloudPhoto(file.path, urlResult.url.toString());
+      }));
 
-      setState(() {
-        _cloudImageURLs = imageUrls;
-      });
+      if (!mounted) return;
+      setState(() => _cloudPhotos = photos);
     } catch (e) {
       print("Error fetching cloud images: $e");
+    } finally {
+      if (mounted) setState(() => _cloudLoading = false);
     }
   }
 
-  Future<void> _deleteCloudImage(String fileUrl) async {
+  Future<void> _deleteCloudImage(CloudPhoto photo) async {
     try {
-      Uri uri = Uri.parse(fileUrl);
-      String path = uri.path;
-      String fileName = path.split('/').last;
-
-      await Amplify.Storage.remove(path: StoragePath.fromString(fileName));
+      await Amplify.Storage.remove(path: StoragePath.fromString(photo.path));
 
       setState(() {
-        _cloudImageURLs.remove(fileUrl);
+        _cloudPhotos.remove(photo);
       });
     } catch (e) {
       print("Error deleting image: $e");
@@ -275,42 +282,92 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
     );
   }
 
-  /// Opens a credibility check for a cloud photo (FR 1.4). The S3 key is the
-  /// last path segment of the photo's signed URL.
-  Future<void> _openCheck(String imageUrl) async {
-    final imageKey = Uri.parse(imageUrl).pathSegments.last;
+  /// Opens a credibility check for a cloud photo (FR 1.4).
+  Future<void> _openCheck(CloudPhoto photo) async {
     Navigator.pop(context); // close the photo dialog
     await Navigator.push(
       context,
-      MaterialPageRoute(builder: (context) => CheckPage(imageKey: imageKey)),
+      MaterialPageRoute(builder: (context) => CheckPage(imageKey: photo.path)),
     );
   }
 
-  AlertDialog _buildCloudImageDialog(String imageUrl) {
+  /// A cloud photo, from the phone's cache after the first download. Grid
+  /// tiles use a small copy ([thumbnail]) so the grid fills in quickly.
+  Widget _cloudImage(CloudPhoto photo, {bool thumbnail = false}) {
+    return CachedNetworkImage(
+      imageUrl: photo.url,
+      cacheKey: thumbnail ? 'thumb:${photo.path}' : photo.path,
+      maxWidthDiskCache: thumbnail ? 400 : null,
+      memCacheWidth: thumbnail ? 300 : null,
+      fit: BoxFit.cover,
+      fadeInDuration: const Duration(milliseconds: 150),
+      placeholder: (context, url) => Container(color: Colors.white24),
+      errorWidget: (context, url, error) => const Icon(Icons.broken_image_outlined),
+    );
+  }
+
+  AlertDialog _buildCloudImageDialog(CloudPhoto photo) {
     // Listing the buttons directly lets the dialog wrap them on narrow screens.
     return AlertDialog(
-      content: Image.network(imageUrl, fit: BoxFit.cover),
+      content: _cloudImage(photo),
       actions: [
         TextButton(
-          onPressed: () async => await _saveToFavorites(imageUrl),
+          onPressed: () async => await _saveToFavorites(photo.url),
           child: const Text('Favorite'),
         ),
         TextButton(
-          onPressed: () => _openCheck(imageUrl),
+          onPressed: () => _openCheck(photo),
           child: const Text('Check'),
         ),
         TextButton(
-          onPressed: () => _openEditor(imageUrl),
+          onPressed: () => _openEditor(photo.url),
           child: const Text('Edit'),
         ),
         TextButton(
           onPressed: () async {
-            await _deleteCloudImage(imageUrl);
+            await _deleteCloudImage(photo);
+            if (!mounted) return;
             Navigator.pop(context);
           },
           child: const Text('Delete'),
         ),
       ],
+    );
+  }
+
+  Widget _cloudTab() {
+    if (_cloudLoading && _cloudPhotos.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    // Pull down to refresh; the empty state scrolls too so the gesture works there.
+    return RefreshIndicator(
+      onRefresh: _fetchCloudImages,
+      child: _cloudPhotos.isEmpty
+          ? ListView(children: const [
+              SizedBox(height: 200),
+              Center(child: Text("No cloud images available.")),
+            ])
+          : GridView.builder(
+              padding: const EdgeInsets.all(8.0),
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 3,
+                crossAxisSpacing: 8.0,
+                mainAxisSpacing: 8.0,
+              ),
+              itemCount: _cloudPhotos.length,
+              itemBuilder: (context, index) {
+                final photo = _cloudPhotos[index];
+                return GestureDetector(
+                  onTap: () {
+                    showDialog(
+                      context: context,
+                      builder: (context) => _buildCloudImageDialog(photo),
+                    );
+                  },
+                  child: _cloudImage(photo, thumbnail: true),
+                );
+              },
+            ),
     );
   }
 
@@ -361,28 +418,7 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
                         );
                       },
                     ),
-              _cloudImageURLs.isEmpty
-                  ? const Center(child: Text("No cloud images available."))
-                  : GridView.builder(
-                      padding: const EdgeInsets.all(8.0),
-                      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                        crossAxisCount: 3,
-                        crossAxisSpacing: 8.0,
-                        mainAxisSpacing: 8.0,
-                      ),
-                      itemCount: _cloudImageURLs.length,
-                      itemBuilder: (context, index) {
-                        return GestureDetector(
-                          onTap: () {
-                            showDialog(
-                              context: context,
-                              builder: (context) => _buildCloudImageDialog(_cloudImageURLs[index]),
-                            );
-                          },
-                          child: Image.network(_cloudImageURLs[index], fit: BoxFit.cover),
-                        );
-                      },
-                    ),
+              _cloudTab(),
             ],
           ),
         ],

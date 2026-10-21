@@ -17,27 +17,44 @@ class MainPage extends StatefulWidget {
 }
 
 class _MainPageState extends State<MainPage> {
-  late List<CameraDescription> cameras = []; // List to store initialized cameras
+  List<CameraDescription> cameras = [];
+  // Only the Camera tab waits for this. Blocking the whole page on it left the
+  // app spinning forever on iPhones (and simulators) where no camera is found.
+  bool _camerasLoaded = false;
   int _pageIndex = 0;
   String _userEmail = '';
 
-  // Initialize the cameras
   Future<void> initializeCameras() async {
     try {
       cameras = await availableCameras();
-      setState(() {});
     } catch (e) {
       print("Error initializing cameras: $e");
     }
+    if (!mounted) return;
+    setState(() => _camerasLoaded = true);
+  }
+
+  Widget _cameraTab() {
+    if (!_camerasLoaded) return const Center(child: CircularProgressIndicator());
+    if (cameras.isEmpty) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Text('No camera is available on this device. You can still add photos from the gallery.',
+              textAlign: TextAlign.center),
+        ),
+      );
+    }
+    return CameraPage(cameras: cameras);
   }
 
   // Get current user's email
   Future<void> _getCurrentUser() async {
     try {
-      final user = await Amplify.Auth.getCurrentUser();
       final userAttributes = await Amplify.Auth.fetchUserAttributes();
       final emailAttribute = userAttributes.firstWhere(
         (attribute) => attribute.userAttributeKey == CognitoUserAttributeKey.email);
+      if (!mounted) return;
       setState(() {
         _userEmail = emailAttribute.value; // Set the user's email
       });
@@ -64,14 +81,12 @@ class _MainPageState extends State<MainPage> {
             end: Alignment.bottomCenter,
           ),
         ),
-        child: cameras.isEmpty
-            ? Center(child: CircularProgressIndicator()) // Show loading while initializing cameras
-            : [
-                const PhotosPage(),
-                const HistoryPage(),
-                const FavoritesPage(),
-                CameraPage(cameras: cameras), // Pass cameras to the CameraPage
-              ][_pageIndex], // Display the selected page based on _pageIndex
+        child: [
+          const PhotosPage(),
+          const HistoryPage(),
+          const FavoritesPage(),
+          _cameraTab(),
+        ][_pageIndex], // Display the selected page based on _pageIndex
       ),
       appBar: AppBar(
         title: Text(_userEmail.isNotEmpty ? _userEmail : "Loading..."),

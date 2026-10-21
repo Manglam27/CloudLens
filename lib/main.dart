@@ -48,10 +48,14 @@ class MyApp extends StatefulWidget {
     }
   }
 
+  // Checked once, not on every rebuild, and given up on after a while so the
+  // app falls back to the login page instead of spinning forever.
+  late final Future<bool> _signedIn = _isUserSignedIn();
+
   Future<bool> _isUserSignedIn() async {
     try {
-      final user = await Amplify.Auth.getCurrentUser();
-      return user != null;
+      await Amplify.Auth.getCurrentUser().timeout(const Duration(seconds: 10));
+      return true;
     } catch (e) {
       return false;
     }
@@ -72,40 +76,23 @@ class MyApp extends StatefulWidget {
 
   @override
   Widget build(BuildContext context) {
-    return FutureBuilder<bool>(
-      future: _isUserSignedIn(),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return MaterialApp(
-            title: 'Cloud Lens',
-            theme: ThemeData(
-              colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
-              useMaterial3: true,
-            ),
-            home: Scaffold(
-              body: Center(child: CircularProgressIndicator()),
-            ),
-          );
-        } else if (snapshot.hasData && snapshot.data == true) {
-          return MaterialApp(
-            title: 'Cloud Lens',
-            theme: ThemeData(
-              colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
-              useMaterial3: true,
-            ),
-            home: MainPage(signOutCallback: _signOut), // Pass the sign-out function
-          );
-        } else {
-          return MaterialApp(
-            title: 'Cloud Lens',
-            theme: ThemeData(
-              colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
-              useMaterial3: true,
-            ),
-            home: LoginPage(signOutCallback:  _signOut),
-          );
-        }
-      },
+    return MaterialApp(
+      title: 'Cloud Lens',
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
+        useMaterial3: true,
+      ),
+      home: FutureBuilder<bool>(
+        future: _signedIn,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Scaffold(body: Center(child: CircularProgressIndicator()));
+          }
+          return snapshot.data == true
+              ? MainPage(signOutCallback: _signOut) // Pass the sign-out function
+              : LoginPage(signOutCallback: _signOut);
+        },
+      ),
     );
   }
 }
