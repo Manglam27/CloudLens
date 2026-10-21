@@ -213,7 +213,7 @@ def main():
     common = {"CHECKS_TABLE": CHECKS_TABLE, "CACHE_TABLE": CACHE_TABLE, "BUCKET_NAME": BUCKET}
     ensure_function(WORKER_FN, worker_role, HERE / "dist" / "check_worker.zip",
                     {**common, "SOURCES_TABLE": SOURCES_TABLE, "T_TRUE": "70", "T_FALSE": "30", "MIN_SOURCES": "2",
-                     "MAX_RESULTS": "5", "EVIDENCE_ENABLED": "true", "GDELT_ENABLED": "true", "MODEL_ID": MODEL_ID, **KEY_PARAMS},
+                     "MAX_RESULTS": "8", "EVIDENCE_ENABLED": "true", "MODEL_ID": MODEL_ID, **KEY_PARAMS},
                     timeout=60, memory=512)
     ensure_function(API_FN, api_role, HERE / "dist" / "check_api.zip",
                     {**common, "WORKER_FUNCTION": WORKER_FN}, timeout=10, memory=256)

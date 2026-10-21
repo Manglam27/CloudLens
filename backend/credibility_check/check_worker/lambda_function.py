@@ -10,17 +10,16 @@ Pipeline:
     1 read text    Amazon Textract
     2 find claim   Claude finds the claim, or says it is an opinion, satire or
                    nothing to check; the rules in claim.py are the fallback
-    3 evidence     Google Fact Check, NewsAPI, The Guardian and GDELT in
-                   parallel, trusted sources only (CloudLensTrustedSources table)
+    3 evidence     Google Fact Check, Google News, Bing News, NewsAPI and The
+                   Guardian in parallel, trusted sources only (CloudLensTrustedSources table)
     4 judge        Claude labels each source Supports, Refutes or Unrelated;
-                   without Claude, fact-check ratings are read by rules
+                   without Claude, fact-check ratings and headlines are read by rules
     5 score        Milestone 2 formula and verdict rules (scoring.py)
 
 Configuration (Lambda environment variables):
     CHECKS_TABLE, CACHE_TABLE, SOURCES_TABLE, BUCKET_NAME
-    T_TRUE=70, T_FALSE=30, MIN_SOURCES=2, MAX_RESULTS=5   verdict limits and result budget
+    T_TRUE=70, T_FALSE=30, MIN_SOURCES=2, MAX_RESULTS=8   verdict limits and result budget
     EVIDENCE_ENABLED=true                  turns steps 3 and 4 on
-    GDELT_ENABLED=true                     the keyless GDELT provider
     MODEL_ID                               Bedrock model, default Claude Haiku 4.5
     FACTCHECK_KEY_PARAM, NEWSAPI_KEY_PARAM, GUARDIAN_KEY_PARAM
                                            SSM SecureStrings holding provider API keys
@@ -166,8 +165,7 @@ def lambda_handler(event, context):
         print(f"check not found: {key}")
         return
     evidence_enabled = os.environ.get("EVIDENCE_ENABLED", "false").lower() == "true"
-    gdelt_enabled = os.environ.get("GDELT_ENABLED", "true").lower() == "true"
-    max_results = int(os.environ.get("MAX_RESULTS", "5"))
+    max_results = int(os.environ.get("MAX_RESULTS", "8"))
     try:
         _update(key, status="READING_TEXT")
         lines = read_text(os.environ["BUCKET_NAME"], item["imageKey"])
@@ -183,8 +181,7 @@ def lambda_handler(event, context):
             if not evidence_enabled:
                 problem, complete = "Evidence search is not enabled yet, so this claim cannot be verified.", False
             else:
-                enabled = [name for name, _, _ in evidence.PROVIDERS if name != "gdelt" or gdelt_enabled]
-                sources, report = evidence.find_evidence(query, _api_keys(), _trusted_sources(), max_results, enabled,
+                sources, report = evidence.find_evidence(query, _api_keys(), _trusted_sources(), max_results,
                                                          also_try=[claim])
                 if report.get(evidence.PRIMARY) != "ok":
                     complete = False  # the main fact-check source was missing or failed
@@ -200,10 +197,11 @@ def lambda_handler(event, context):
                 stances, reason = llm.judge_sources(claim, sources)
             except llm.LLMError:
                 traceback.print_exc()
-                stances = [evidence.fallback_stance(s) for s in sources]
+                stances = evidence.fallback_stances(sources)
                 reason, complete = evidence.summarize(sources, stances), False
         scored = score_evidence(
-            [{"domain": s["domain"], "weight": s["weight"], "stance": st} for s, st in zip(sources, stances)],
+            [{"domain": s["domain"], "weight": s["weight"], "stance": st, "kind": s["kind"],
+              "relevance": s.get("relevance", 0)} for s, st in zip(sources, stances)],
             int(os.environ.get("T_TRUE", "70")), int(os.environ.get("T_FALSE", "30")),
             int(os.environ.get("MIN_SOURCES", "2")))
         # Off-topic search results are not shown.

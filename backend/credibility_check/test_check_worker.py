@@ -106,6 +106,14 @@ class ScoringTest(unittest.TestCase):
                             self.ev("bbc.com", "SUPPORTS", 0.6)])
         self.assertEqual((r["verdict"], r["score"]), ("FALSE", 23))
 
+    def test_one_fact_check_of_the_same_claim_decides(self):
+        check = {"domain": "fullfact.org", "stance": "REFUTES", "weight": 1.0, "kind": "fact_check", "relevance": 0.9}
+        self.assertEqual(score_evidence([check])["verdict"], "FALSE")
+        loose = {**check, "relevance": 0.5}
+        self.assertEqual(score_evidence([loose])["verdict"], "UNVERIFIED")
+        news = {**check, "domain": "cnn.com", "kind": "news", "stance": "SUPPORTS", "weight": 0.6}
+        self.assertEqual(score_evidence([news])["verdict"], "UNVERIFIED")  # news needs 2 sites
+
     def test_one_site_counts_once(self):
         r = score_evidence([self.ev("snopes.com", "REFUTES"), self.ev("snopes.com", "REFUTES")])
         self.assertEqual((r["verdict"], r["refuters"]), ("UNVERIFIED", 1))

@@ -140,8 +140,11 @@ def judge_sources(claim, sources):
     """Returns ([stance for each source, in order], reason). Missing indexes count as UNRELATED."""
     def describe(i, s):
         if s.get("kind", "fact_check") == "fact_check":
+            # Fact-check articles found in news feeds have a headline and summary but no rating.
             return (f"[{i}] Fact-check by {s['publisher']} ({s['domain']})\n"
-                    f"Claim reviewed: {s['claim_reviewed']}\nTitle: {s['title']}\nRating: {s['rating']}")
+                    f"Claim reviewed: {s.get('claim_reviewed') or '(not given)'}\nTitle: {s['title']}\n"
+                    f"Rating: {s.get('rating') or '(none; see title and summary)'}\n"
+                    f"Summary: {s.get('summary') or '(none)'}")
         return (f"[{i}] News article from {s['publisher']} ({s['domain']})\n"
                 f"Headline: {s['title']}\nSummary: {s.get('summary') or '(none)'}")
 

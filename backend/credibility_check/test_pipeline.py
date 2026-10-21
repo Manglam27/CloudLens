@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,10 +23,10 @@ CLAIM = "Drinking two cups of coffee a day cures the flu."
 GOOGLE_PARAM, NEWSAPI_PARAM = "/cloudlens/google-factcheck-api-key", "/cloudlens/newsapi-key"
 
 
-def review(site, rating, url=None, claimed=CLAIM):
+def review(site, rating, url=None, claimed=CLAIM, title="Does coffee cure the flu?"):
     return {"text": claimed, "claimReview": [{
         "publisher": {"name": site.split(".")[0].title(), "site": site},
-        "url": url or f"https://{site}/coffee-flu", "title": "Does coffee cure the flu?", "textualRating": rating}]}
+        "url": url or f"https://{site}/coffee-flu", "title": title, "textualRating": rating}]}
 
 
 def seed_sources():
@@ -89,11 +90,11 @@ class FakeWeb:
 class EvidenceTest(unittest.TestCase):
     def setUp(self):
         self.web = FakeWeb()
-        self._original = evidence._http_get_json
-        evidence._http_get_json = self.web
+        self._original = evidence._http_get_json, evidence._http_get_xml
+        evidence._http_get_json = evidence._http_get_xml = self.web
 
     def tearDown(self):
-        evidence._http_get_json = self._original
+        evidence._http_get_json, evidence._http_get_xml = self._original
 
     def test_trust_lookup_matches_subdomains_and_respects_disabled_entries(self):
         sources = seed_sources()
@@ -118,7 +119,7 @@ class EvidenceTest(unittest.TestCase):
         self.assertEqual([i["domain"] for i in items], ["snopes.com", "usatoday.com", "reuters.com"])
         self.assertEqual([i["kind"] for i in items], ["fact_check", "fact_check", "news"])
         self.assertEqual(report, {"google_fact_check": "ok", "newsapi": "ok", "guardian": "skipped",
-                                  "gdelt": "failed"})
+                                  "google_news": "failed", "bing_news": "failed"})
 
     def test_newsapi_key_travels_in_a_header_and_domains_are_trusted_only(self):
         self.web.responses = {"newsapi.org": {"status": "ok", "articles": []}}
@@ -131,13 +132,14 @@ class EvidenceTest(unittest.TestCase):
 
     def test_result_count_is_capped(self):
         self.web.responses = {"factchecktools": {"claims": [
-            review("snopes.com", "False", url=f"https://snopes.com/{i}") for i in range(9)]}}
-        items, _ = evidence.find_evidence("q", {"google_fact_check": "G"}, seed_sources(), 5)
+            review("snopes.com", "False", url=f"https://snopes.com/{i}", title=f"Coffee and flu, part {i}")
+            for i in range(9)]}}
+        items, _ = evidence.find_evidence("coffee flu", {"google_fact_check": "G"}, seed_sources(), 5)
         self.assertEqual(len(items), 5)
 
     def test_errors_never_leak_api_keys(self):
         import urllib.error
-        evidence._http_get_json = self._original
+        evidence._http_get_json, evidence._http_get_xml = self._original
         original_urlopen = evidence.urllib.request.urlopen
 
         def boom(request, timeout):
@@ -215,13 +217,81 @@ class EvidenceTest(unittest.TestCase):
         def web(url, timeout=None, headers=None):
             if "hantavirus" not in url:
                 raise evidence.EvidenceError("HTTP 500")
-            return {"claims": [review("fullfact.org", "False")]}
+            return {"claims": [review("fullfact.org", "False", claimed="China bans US citizens over hantavirus")]}
 
         evidence._http_get_json = web
         items, report = evidence.find_evidence("China bans US citizens enter country outbreaking hantavirus",
                                                {"google_fact_check": "G"}, seed_sources(), 5,
                                                enabled=["google_fact_check"], also_try=["China bans US citizens"])
         self.assertEqual((len(items), report["google_fact_check"]), (1, "ok"))
+
+    def test_news_feeds_find_fact_checks_and_reports(self):
+        google = ET.fromstring("""<rss><channel>
+            <item><title>Fact Check: China has not banned US citizens over hantavirus - Reuters</title>
+                  <link>https://news.google.com/rss/articles/a</link><source url="https://www.reuters.com">Reuters</source></item>
+            <item><title>China hasn’t banned US citizens over hantavirus - Full Fact</title>
+                  <link>https://news.google.com/rss/articles/b</link><source url="https://fullfact.org">Full Fact</source></item>
+            <item><title>China news roundup - Some Blog</title>
+                  <link>https://news.google.com/rss/articles/c</link><source url="https://someblog.net">Some Blog</source></item>
+        </channel></rss>""")
+        bing = ET.fromstring("""<rss xmlns:news="https://www.bing.com/news"><channel>
+            <item><title>Did China ban US citizens over hantavirus?</title>
+                  <link>http://www.bing.com/news/apiclick.aspx?ref=FexRss&amp;url=https%3a%2f%2fwww.msn.com%2fen-us%2fx</link>
+                  <description>No, China has not banned American citizens.</description>
+                  <news:Source>Snopes on MSN</news:Source></item>
+        </channel></rss>""")
+        self.web.responses = {"news.google.com": google, "bing.com": bing}
+        items, report = evidence.find_evidence("China bans US citizens hantavirus", {}, seed_sources(), 8,
+                                               enabled=["google_news", "bing_news"])
+        by_domain = {i["domain"]: i for i in items}
+        self.assertEqual(sorted(by_domain), ["fullfact.org", "reuters.com", "snopes.com"])  # blog dropped
+        self.assertTrue(all(i["kind"] == "fact_check" for i in items))
+        self.assertEqual(by_domain["reuters.com"]["title"], "Fact Check: China has not banned US citizens over hantavirus")
+        self.assertEqual([evidence.fallback_stance(by_domain[d]) for d in ("reuters.com", "fullfact.org", "snopes.com")],
+                         ["REFUTES"] * 3)  # headline, curly apostrophe, and a question answered by its summary
+        self.assertEqual(report, {"google_news": "ok", "bing_news": "ok", "google_fact_check": "skipped",
+                                  "newsapi": "skipped", "guardian": "skipped"})
+
+    def test_fact_checks_outrank_keyword_matched_news(self):
+        check = {"kind": "fact_check", "rating": "False", "title": "No, 5G does not spread COVID", "relevance": 0.8}
+        news = {"kind": "news", "rating": "", "title": "Twitter bans attacks on 5G towers over coronavirus",
+                "summary": "", "relevance": 0.75}
+        self.assertEqual(evidence.fallback_stance(news), "SUPPORTS")
+        self.assertEqual(evidence.fallback_stances([check, news]), ["REFUTES", "RELATED"])
+        self.assertEqual(evidence.fallback_stance({**check, "rating": "", "title": "Trump wrong that X equals Y"}),
+                         "REFUTES")
+
+    def test_copies_of_one_article_are_merged(self):
+        self.web.responses = {
+            "factchecktools": {"claims": [review("snopes.com", "", url="https://snopes.com/a", title="Coffee and flu?")]},
+            "newsapi.org": {"status": "ok", "articles": [
+                {"source": {"name": "Snopes"}, "url": "https://snopes.com/b", "title": "Coffee and flu?",
+                 "description": "No evidence coffee cures flu."}]}}
+        items, _ = evidence.find_evidence("coffee cures flu", {"google_fact_check": "G", "newsapi": "N"},
+                                          seed_sources(), 8)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["summary"], "No evidence coffee cures flu.")
+
+    def test_different_sites_come_before_a_second_article_from_one_site(self):
+        self.web.responses = {"newsapi.org": {"status": "ok", "articles": [
+            {"source": {"name": "CNN"}, "url": f"https://www.cnn.com/{i}", "title": f"Ohio chemical blast evacuations {i}"}
+            for i in range(3)] + [{"source": {"name": "PBS"}, "url": "https://www.pbs.org/a",
+                                   "title": "Ohio chemical explosion evacuations"}]}}
+        items, _ = evidence.find_evidence("Ohio chemical blast evacuations", {"newsapi": "N"}, seed_sources(), 2,
+                                          enabled=["newsapi"])
+        self.assertEqual([i["domain"] for i in items], ["cnn.com", "pbs.org"])
+
+    def test_matching_news_must_name_the_same_places(self):
+        def stance(title):
+            item = {"kind": "news", "title": title, "summary": "", "claim_reviewed": "", "rating": ""}
+            query = "chemical tank blast Ohio forced evacuations"
+            item.update(relevance=evidence.relevance(query, item),
+                        core_relevance=evidence.relevance(evidence.short_query(query), item),
+                        names_found=evidence.relevance(evidence._names(query), item))
+            return evidence.fallback_stance(item)
+
+        self.assertEqual(stance("Ohio chemical tank blast forces evacuations"), "SUPPORTS")
+        self.assertEqual(stance("California chemical tank blast forces evacuations"), "RELATED")
 
     def test_off_topic_news_is_dropped(self):
         self.web.responses = {"content.guardianapis.com": {"response": {"status": "ok", "results": [
@@ -271,11 +341,11 @@ class PipelineTest(unittest.TestCase):
         self.web = FakeWeb()
         self.web.responses = {"factchecktools": {"claims": [
             review("snopes.com", "False"), review("politifact.com", "Pants on Fire"), review("randomblog.net", "False")]}}
-        self._original = evidence._http_get_json
-        evidence._http_get_json = self.web
+        self._original = evidence._http_get_json, evidence._http_get_xml
+        evidence._http_get_json = evidence._http_get_xml = self.web
 
     def tearDown(self):
-        evidence._http_get_json = self._original
+        evidence._http_get_json, evidence._http_get_xml = self._original
 
     def run_check(self, claude):
         llm._client = claude
@@ -290,7 +360,7 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(item["reason"], "Two fact-checkers rated this claim false.")
         self.assertEqual([s["domain"] for s in item["sources"]], ["snopes.com", "politifact.com"])
         self.assertNotIn("randomblog", claude.calls[1]["messages"][0]["content"])  # untrusted never sent
-        self.assertEqual(item["providers"]["gdelt"], "failed")  # rate-limited, but not needed
+        self.assertEqual(item["providers"]["google_news"], "failed")  # unavailable, but not needed
         self.assertIn(("h",), self.cache.items)  # the main source worked, so the result is cached
 
     def test_two_supporting_wire_services_give_true(self):
@@ -299,8 +369,14 @@ class PipelineTest(unittest.TestCase):
         item = self.run_check(FakeClaude(stances=["SUPPORTS", "SUPPORTS"], reason="Two sources confirm it."))
         self.assertEqual((item["verdict"], item["score"]), ("TRUE", 100))
 
-    def test_one_source_is_not_enough(self):
+    def test_one_fact_check_of_the_same_claim_is_enough(self):
         self.web.responses = {"factchecktools": {"claims": [review("snopes.com", "False")]}}
+        item = self.run_check(FakeClaude())
+        self.assertEqual((item["verdict"], item["score"]), ("FALSE", 0))
+
+    def test_one_loosely_matching_fact_check_is_not_enough(self):
+        self.web.responses = {"factchecktools": {"claims": [
+            review("snopes.com", "False", claimed="Coffee shortages hit cafes", title="Coffee shortage claims")]}}
         item = self.run_check(FakeClaude())
         self.assertEqual((item["verdict"], item["score"]), ("UNVERIFIED", 0))
         self.assertIn("Fewer than 2 independent trusted sources", item["reason"])
@@ -347,7 +423,6 @@ class PipelineTest(unittest.TestCase):
         self.sources.items[("snopes.com",)]["enabled"] = False
         item = self.run_check(FakeClaude())
         self.assertEqual([s["domain"] for s in item["sources"]], ["politifact.com"])
-        self.assertEqual(item["verdict"], "UNVERIFIED")
 
     def test_source_added_to_the_table_is_trusted(self):
         self.sources.put_item({"domain": "randomblog.net", "name": "Random Blog", "category": "fact_checker",

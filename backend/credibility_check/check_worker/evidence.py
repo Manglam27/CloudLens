@@ -2,13 +2,15 @@
 results from trusted sources (the CloudLensTrustedSources table).
 
 Providers:
-    google_fact_check  Google Fact Check Tools API (key)  published fact-checks, the main source
-    newsapi            NewsAPI.org (key)                   news limited to trusted domains
-    guardian           The Guardian Content API (key)      Guardian reporting
-    gdelt              GDELT DOC 2.0 API (no key)          news index; heavily rate-limited, best effort
+    google_fact_check  Google Fact Check Tools API (key)  rated fact-checks, the main source
+    google_news        Google News RSS (no key)            news and fact-check articles from many outlets
+    bing_news          Bing News RSS (no key)              the same from Bing's index, with summaries
+    newsapi            NewsAPI.org (key, optional)         news limited to trusted domains
+    guardian           The Guardian Content API (key, optional)
 
 Each item: {"kind": "fact_check" | "news", "provider", "domain", "publisher",
-"url", "title", "rating", "summary", "claim_reviewed", "weight"}.
+"url", "title", "rating", "summary", "claim_reviewed", "weight"}. Articles
+from fact-checking sites, or headlined "Fact check", count as fact-checks.
 """
 
 import concurrent.futures
@@ -17,10 +19,11 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 TIMEOUT_SECONDS = 8
-GDELT_TIMEOUT_SECONDS = 4
+FEED_ITEMS = 30  # news feed entries read per search; only trusted ones are kept
 CATEGORY_WEIGHTS = {"fact_checker": 1.0, "wire_service": 1.0, "news_outlet": 0.6}
 NEWS_CATEGORIES = ("wire_service", "news_outlet")
 SEED_FILE = Path(__file__).with_name("trusted_sources.json")
@@ -71,6 +74,15 @@ class TrustedSources:
     def domains(self, categories):
         return sorted(d for d, e in self.by_domain.items() if e.get("enabled", True) and e.get("category") in categories)
 
+    def category(self, domain):
+        entry = self.lookup(domain)
+        return entry.get("category", "") if entry else ""
+
+    def domain_named(self, name):
+        """The domain of a source by its name ("Snopes" -> "snopes.com"), or None."""
+        name = (name or "").strip().lower()
+        return next((d for d, e in self.by_domain.items() if (e.get("name") or "").lower() == name), None)
+
 
 def _http_get_json(url, timeout=TIMEOUT_SECONDS, headers=None):
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
@@ -82,6 +94,32 @@ def _http_get_json(url, timeout=TIMEOUT_SECONDS, headers=None):
         raise EvidenceError(f"HTTP {e.code}") from None
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as e:
         raise EvidenceError(f"request failed: {type(e).__name__}") from None
+
+
+def _http_get_xml(url, timeout=TIMEOUT_SECONDS):
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return ET.fromstring(response.read())
+    except urllib.error.HTTPError as e:
+        raise EvidenceError(f"HTTP {e.code}") from None
+    except (urllib.error.URLError, TimeoutError, ET.ParseError) as e:
+        raise EvidenceError(f"request failed: {type(e).__name__}") from None
+
+
+def _run_all(search, queries):
+    """Runs search(q) for every query in parallel; returns the results that worked."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(queries)) as pool:
+        futures = [pool.submit(search, q) for q in queries]
+    results, errors = [], []
+    for future in futures:
+        try:
+            results.append(future.result())
+        except EvidenceError as e:
+            errors.append(e)
+    if not results:
+        raise errors[0]
+    return results
 
 
 def _item(kind, provider, url, title, sources, publisher="", rating="", summary="", claim_reviewed="", domain=None):
@@ -112,17 +150,7 @@ def google_fact_check(queries, key, sources, limit):
     queries = [queries] if isinstance(queries, str) else list(queries)
     # The search is picky about wording and its results vary between calls, so
     # several phrasings run together, the last being the few most distinctive words.
-    queries = list(dict.fromkeys(q for q in queries + [short_query(queries[0])] if q))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(queries)) as pool:
-        futures = [pool.submit(search, q) for q in queries]
-        results = []
-        for future in futures:
-            try:
-                results.append(future.result())
-            except EvidenceError as e:
-                print(f"fact-check search failed: {e}")
-    if not results:
-        raise EvidenceError("every fact-check search failed")
+    results = _run_all(search, list(dict.fromkeys(q for q in queries + [short_query(queries[0])] if q)))
     print(f"fact-check searches: {[len(r.get('claims', [])) for r in results]} results")
     items = []
     for claim in (c for r in results for c in r.get("claims", [])):
@@ -159,18 +187,58 @@ def guardian(query, key, sources, limit):
             for r in data.get("results", [])]
 
 
-def gdelt(query, key, sources, limit):
-    domains = " OR ".join(f"domainis:{d}" for d in sources.domains(NEWS_CATEGORIES))
-    params = urllib.parse.urlencode({"query": f"{query} ({domains}) sourcelang:english", "mode": "artlist",
-                                     "format": "json", "maxrecords": limit, "sort": "hybridrel"})
-    data = _http_get_json(f"https://api.gdeltproject.org/api/v2/doc/doc?{params}", timeout=GDELT_TIMEOUT_SECONDS)
-    return [_item("news", "gdelt", a.get("url", ""), a.get("title"), sources, domain=a.get("domain") or a.get("url"))
-            for a in data.get("articles", [])]
+_FACT_CHECK_HEADLINE = re.compile(r"\bfact[ -]?check", re.I)
 
 
-# (name, search function, needs a key). Google is the main source of evidence.
-PROVIDERS = [("google_fact_check", google_fact_check, True), ("newsapi", newsapi, True),
-             ("guardian", guardian, True), ("gdelt", gdelt, False)]
+def _feed_item(provider, url, title, sources, publisher, domain, summary=""):
+    """A news feed entry; articles by fact-checkers or headlined "Fact check" count as fact-checks."""
+    domain = normalize_domain(domain or url)
+    is_fact_check = sources.category(domain) == "fact_checker" or _FACT_CHECK_HEADLINE.search(title or "")
+    return _item("fact_check" if is_fact_check else "news", provider, url, title, sources, publisher=publisher,
+                 summary=summary, domain=domain)
+
+
+def google_news(query, key, sources, limit):
+    def search(q):
+        params = urllib.parse.urlencode({"q": q, "hl": "en-US", "gl": "US", "ceid": "US:en"})
+        return _http_get_xml(f"https://news.google.com/rss/search?{params}")
+
+    items = []
+    for root in _run_all(search, [query, f"{query} fact check"]):
+        for entry in root.findall("./channel/item")[:FEED_ITEMS]:
+            source = entry.find("source")
+            publisher = (source.text or "") if source is not None else ""
+            # Headlines end with " - Publisher".
+            title = entry.findtext("title", "").removesuffix(f" - {publisher}")
+            items.append(_feed_item("google_news", entry.findtext("link", ""), title, sources, publisher,
+                                    source.get("url", "") if source is not None else ""))
+    return items
+
+
+def bing_news(query, key, sources, limit):
+    def search(q):
+        params = urllib.parse.urlencode({"q": q, "format": "rss", "mkt": "en-US"})
+        return _http_get_xml(f"https://www.bing.com/news/search?{params}")
+
+    items = []
+    for root in _run_all(search, [query, f"{query} fact check"]):
+        for entry in root.findall("./channel/item")[:FEED_ITEMS]:
+            link = entry.findtext("link", "")
+            # Links go through a Bing redirect that carries the article address.
+            url = urllib.parse.parse_qs(urllib.parse.urlparse(link).query).get("url", [link])[0]
+            publisher = next((c.text or "" for c in entry if c.tag.endswith("Source")), "")
+            domain = normalize_domain(url)
+            if publisher.endswith(" on MSN"):  # a syndicated copy: credit the original publisher
+                publisher = publisher.removesuffix(" on MSN")
+                domain = sources.domain_named(publisher) or domain
+            items.append(_feed_item("bing_news", url, entry.findtext("title", ""), sources, publisher, domain,
+                                    summary=entry.findtext("description", "")))
+    return items
+
+
+# (name, search function, needs a key). Google Fact Check is the main source of evidence.
+PROVIDERS = [("google_fact_check", google_fact_check, True), ("google_news", google_news, False),
+             ("bing_news", bing_news, False), ("newsapi", newsapi, True), ("guardian", guardian, True)]
 PRIMARY = "google_fact_check"
 
 
@@ -199,18 +267,38 @@ def find_evidence(query, keys, sources, limit, enabled=None, also_try=()):
             except EvidenceError as e:
                 print(f"evidence provider {name} failed: {e}")
                 report[name] = "failed"
-    items, seen = [], set()
+    unique = {}
     for item in found:
-        if item["url"] and item["url"] not in seen and item["weight"] > 0:
-            seen.add(item["url"])
-            item["relevance"] = relevance(query, item)
-            # News search matches loosely; skip articles that share few of the claim's words.
-            if item["kind"] == "fact_check" or item["relevance"] >= MIN_RELEVANCE:
-                items.append(item)
+        if not item["url"] or item["weight"] <= 0:
+            continue
+        # The same article can come from several providers under different links;
+        # keep one copy with whatever details (rating, summary) any of them had.
+        title = re.sub(r"\W+", " ", item["title"].lower()).strip()[:80]
+        key = (item["domain"], title) if title else item["url"]
+        if key in unique:
+            kept = unique[key]
+            for field in ("rating", "summary", "claim_reviewed"):
+                kept[field] = kept[field] or item[field]
+        else:
+            unique[key] = item
+    items, names = [], _names(query)
+    for item in unique.values():
+        item["relevance"] = relevance(query, item)
+        item["core_relevance"] = relevance(short_query(query), item)
+        item["names_found"] = relevance(names, item) if names else 1.0
+        # News search matches loosely; skip articles that share few of the claim's words.
+        # Fact-checks get a lower bar: Claude, or the stance rules, decide whether they fit.
+        if item["relevance"] >= (MIN_RELEVANCE / 2 if item["kind"] == "fact_check" else MIN_RELEVANCE):
+            items.append(item)
     order = {name: i for i, (name, _, _) in enumerate(PROVIDERS)}
     items.sort(key=lambda i: (i["kind"] != "fact_check", -round(i["relevance"], 1), -i["weight"],
                               order[i["provider"]]))
-    return items[:limit], report
+    # Prefer different sites: a site's second article only gets a slot after every site has one.
+    firsts, repeats, sites = [], [], set()
+    for item in items:
+        (repeats if item["domain"] in sites else firsts).append(item)
+        sites.add(item["domain"])
+    return (firsts + repeats)[:limit], report
 
 
 MIN_RELEVANCE = 0.4
@@ -223,22 +311,35 @@ _SYNONYMS = {"coronavirus": "covid", "sars": "covid", "us": "usa", "america": "u
 
 
 def _stem(word):
-    """Crude stemming so "ballots", "spreading" and "banned" match "ballot", "spread" and "ban"."""
+    """Crude stemming so "ballots", "spreading", "banned" and "approves" match "ballot", "spread", "ban"
+    and "approved"."""
     for suffix in ("ing", "ed", "s"):
         if word.endswith(suffix) and len(word) - len(suffix) >= 3:
             word = word[:-len(suffix)]
             if len(word) > 3 and word[-1] == word[-2] and word[-1] not in "aeiouls":
                 word = word[:-1]  # "bann" -> "ban"
             break
-    return word
+    return word[:-1] if len(word) > 4 and word.endswith("e") else word
+
+
+_SHORT_WORDS = {"uk", "eu", "un", "ai", "usa"}  # two-letter words that are names
 
 
 def _keywords(text):
     words = _WORD.findall(re.sub(r"['’]s\b", "", (text or "").lower()))
     words = (_SYNONYMS.get(w, w) for w in words)
-    # Short words count only when they carry a digit, like "5g".
+    # Other short words count only when they carry a digit, like "5g".
     return {_SYNONYMS.get(_stem(w), _stem(w)) for w in words
-            if (len(w) > 2 or any(c.isdigit() for c in w)) and w not in _COMMON}
+            if (len(w) > 2 or w in _SHORT_WORDS or any(c.isdigit() for c in w)) and w not in _COMMON}
+
+
+def _names(query):
+    """Capitalized words after the first: places, people and organizations ("Ohio", "Stephen Hubbard").
+    Empty for all-caps text, where capitals say nothing."""
+    words = query.split()
+    if query.isupper():
+        return ""
+    return " ".join(w for w in words[1:] if w[:1].isupper())
 
 
 def relevance(query, item):
@@ -264,13 +365,18 @@ _REFUTES = re.compile(r"false|fake|pants on fire|incorrect|inaccurate|misleading
 _SUPPORTS = re.compile(r"\btrue\b|correct|accurate|confirmed|\breal\b|legit", re.I)
 # Fact-check headlines that say the claim is wrong: "Spotify Did NOT Remove...", "No, ...".
 _TITLE_REFUTES = re.compile(r"\b(did not|didn't|does not|doesn't|is not|isn't|was not|wasn't|has not|hasn't|"
-                            r"no evidence|false|fake|hoax|debunk\w*|myth)\b|^(fact check:\s*)?no\b", re.I)
+                            r"have not|haven't|are not|aren't|never|no evidence|false\w*|fake|hoax|debunk\w*|myth|"
+                            r"misleading|fabricated|altered|doctored|satire|scam|baseless|unfounded|misrepresent\w*|"
+                            r"wrong|incorrect|inaccurate|untrue|"
+                            r"out of context|not real|not true)\b|^(fact[ -]?check:?\s*)?no\b", re.I)
+_TITLE_SUPPORTS = re.compile(r"^(fact[ -]?check:?\s*)?(yes|true)\b|\b(is|are|was) (true|real|accurate|correct)\b", re.I)
 # Words that mean a news story questions the claim instead of reporting it as fact.
 _DOUBT = re.compile(r"\b(false|fake|hoax|debunk\w*|myths?|rumou?rs?|conspirac\w*|misleading|misinformation|"
                     r"disinformation|no evidence|viral|claims?|claimed|alleged\w*|denie[sd]|deny|not|isn't|fact.?check\w*)\b",
                     re.I)
-MIN_FACT_CHECK_RELEVANCE = 0.4
+MIN_FACT_CHECK_RELEVANCE = 0.5
 NEWS_SUPPORT_RELEVANCE = 0.7
+CORE_SUPPORT_RELEVANCE = 0.75  # share of the claim's few most distinctive words
 
 
 def fallback_stance(item):
@@ -286,12 +392,32 @@ def fallback_stance(item):
             return "REFUTES"
         if _SUPPORTS.search(rating):
             return "SUPPORTS"
-        # No clear rating: a fact-check's headline usually states its finding.
-        return "REFUTES" if _TITLE_REFUTES.search(item.get("title", "")) else "RELATED"
+        # No clear rating: a fact-check's headline usually states its finding, and
+        # when the headline is a question ("Did Spotify remove...?") the summary does.
+        title = item.get("title", "")
+        finding = f"{title} {item.get('summary', '')}" if title.rstrip().endswith("?") else title
+        finding = finding.replace("’", "'")  # "hasn’t" -> "hasn't"
+        if _TITLE_REFUTES.search(finding):
+            return "REFUTES"
+        return "SUPPORTS" if _TITLE_SUPPORTS.search(finding) else "RELATED"
     # Trusted outlets reporting the same thing as plain news back the claim up.
-    if relevance >= NEWS_SUPPORT_RELEVANCE and not _DOUBT.search(f"{item['title']} {item['summary']}"):
+    # Headlines are short, so a story that has most of the claim's core words counts too.
+    matches = relevance >= NEWS_SUPPORT_RELEVANCE or (
+        relevance >= MIN_RELEVANCE + 0.1 and item.get("core_relevance", 0) >= CORE_SUPPORT_RELEVANCE)
+    # ...and it must be about the same people and places.
+    same_names = item.get("names_found", 1.0) >= 0.5
+    if matches and same_names and not _DOUBT.search(f"{item['title']} {item['summary']}"):
         return "SUPPORTS"
     return "RELATED" if relevance >= MIN_RELEVANCE else "UNRELATED"
+
+
+def fallback_stances(items):
+    """fallback_stance for every item. Published fact-checks outrank keyword matching:
+    once one refutes the claim, news stories no longer count as support."""
+    stances = [fallback_stance(i) for i in items]
+    if any(s == "REFUTES" and i["kind"] == "fact_check" for i, s in zip(items, stances)):
+        stances = ["RELATED" if s == "SUPPORTS" and i["kind"] == "news" else s for i, s in zip(items, stances)]
+    return stances
 
 
 def summarize(items, stances):
@@ -301,7 +427,8 @@ def summarize(items, stances):
     mixed = sum(1 for s in stances if s == "MIXED")
     others = sum(1 for s in stances if s == "RELATED")
     if supports and refutes:
-        return "Trusted sources disagree about this claim."
+        return (f"{refutes} trusted source{'s' if refutes > 1 else ''} rated this claim false, while "
+                f"{supports} other{'s' if supports > 1 else ''} seem{'' if supports > 1 else 's'} to back it up.")
     if refutes:
         return f"{refutes} trusted fact-check{'s' if refutes > 1 else ''} rated this claim false or misleading."
     if supports:
