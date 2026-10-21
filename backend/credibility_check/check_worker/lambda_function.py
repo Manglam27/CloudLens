@@ -135,7 +135,8 @@ def find_claim(lines):
     except llm.LLMError:
         traceback.print_exc()
         claim = rules.find_claim(lines)
-        return ("claim" if claim else "no_claim"), claim, claim or "", False
+        query = rules.search_query(claim) if claim else ""
+        return ("claim" if claim else "no_claim"), claim, query, False
 
 
 def explain(lines, kind, claim, problem, sources, scored, reason):

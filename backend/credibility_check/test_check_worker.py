@@ -10,7 +10,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE / "check_worker"))
 from fakes import FakeTable, FakeTextract  # noqa: E402
 import lambda_function as worker  # noqa: E402  (check_worker/lambda_function.py)
-from claim import clean_lines, find_claim  # noqa: E402
+from claim import clean_lines, find_claim, search_query  # noqa: E402
 from scoring import score_evidence  # noqa: E402
 
 USER, CHECK = "44b8a418-d021-70bf-86aa-875bc10aeb8c", "1790380000000-abcdef12"
@@ -48,6 +48,21 @@ class ClaimTest(unittest.TestCase):
 
     def test_header_with_name_and_date(self):
         self.assertEqual(clean_lines(["Jane Doe @janedoe · Sep 1", "Jane Doe @janedoe - 5m"]), [])
+
+    def test_long_display_name_is_removed(self):
+        lines = ["Daily News Now", "@dailynewsnow · 2h", "5G towers are spreading the coronavirus,",
+                 "scientists confirm."]
+        self.assertEqual(find_claim(lines), "5G towers are spreading the coronavirus, scientists confirm.")
+
+    def test_line_before_a_mention_in_the_post_is_kept(self):
+        lines = ["Huge congratulations to the whole team and", "@janedoe for winning the award."]
+        self.assertEqual(clean_lines(lines), lines)
+
+    def test_search_query_keeps_the_keywords(self):
+        self.assertEqual(search_query("5G towers are spreading the coronavirus, scientists confirm."),
+                         "5G towers spreading coronavirus")
+        self.assertEqual(search_query("BREAKING: Drinking two cups of coffee a day cures the flu, doctors say."),
+                         "Drinking two cups coffee day cures flu")
 
     def test_no_claim_without_a_full_sentence(self):
         self.assertIsNone(find_claim(["Jane Doe", "@janedoe", "lol", "1.2K Likes"]))

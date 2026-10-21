@@ -37,10 +37,14 @@ def is_noise(line):
 
 def clean_lines(lines):
     """Drops interface text and short labels such as display names."""
+    lines = [line.strip() for line in lines]
     kept = []
-    for line in lines:
-        line = line.strip()
+    for i, line in enumerate(lines):
         if not line or is_noise(line):
+            continue
+        # The line above an "@handle · 2h" header is the poster's display name.
+        after = lines[i + 1] if i + 1 < len(lines) else ""
+        if after.startswith("@") and is_noise(after) and not re.search(r"[.!?]$", line):
             continue
         # Short lines without sentence punctuation are names, labels or buttons.
         if len(line.split()) < 3 and not re.search(r"[.!?]$", line):
@@ -57,3 +61,24 @@ def find_claim(lines):
     if not candidates:
         return None
     return max(candidates, key=len)[:MAX_CLAIM_CHARS]
+
+
+MAX_QUERY_WORDS = 8
+_STOPWORDS = frozenset("""a an the is are was were be been being am of to in on for with and or but that this
+    these those it its as at by from has have had do does did will would can could should may might just
+    very so than then there their they them he she his her we our you your i me my""".split())
+_LEAD = re.compile(r"^(breaking|update|just in|urgent|alert)\s*[:!\-]\s*", re.I)
+_ATTRIBUTION = re.compile(
+    r",?\s*\b(doctors|scientists|experts|researchers|officials|sources|reports?|studies|a study)\s+"
+    r"(say|says|said|confirm|confirms|confirmed|warn|warns|show|shows|find|finds|found|claim|claims)\b", re.I)
+
+
+def search_query(claim):
+    """Keywords for the fact-check search, used when Claude can't write the query.
+
+    Fact-check search matches a few keywords far better than a whole sentence,
+    so this drops "BREAKING:", "doctors say" and common words.
+    """
+    text = _ATTRIBUTION.sub("", _LEAD.sub("", claim))
+    words = [w for w in re.findall(r"[\w'%$]+(?:-[\w']+)*", text) if w.lower() not in _STOPWORDS]
+    return " ".join(words[:MAX_QUERY_WORDS])
