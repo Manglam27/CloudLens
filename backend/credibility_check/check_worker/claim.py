@@ -17,7 +17,7 @@ _AGE = r"\d+\s*(s|m|h|d|w|min|mins|hr|hrs)"
 _COUNT = r"\d+([.,]\d+)?\s*[kmb]?"
 _ACTION = r"(likes?|retweets?|reposts?|repl(y|ies)|comments?|shares?|views?|quotes?|bookmarks?)"
 # Separator dots in post headers. OCR often reads "·" as "." or "-".
-_SEP = r"\s*[·•|.\-]\s*"
+_SEP = r"(\s*[·•|.\-]\s*|\s+)"  # or dropped altogether: "@handle 2h"
 _NOISE = [re.compile(p, re.I) for p in (
     r"@\w+(" + _SEP + "(" + _AGE + "|" + _DATE + "))?",          # "@handle" or "@handle · 2h"
     r".*\B@\w+" + _SEP + "(" + _AGE + "|" + _DATE + ")",          # "Jane Doe @handle · 2h"
@@ -50,8 +50,11 @@ def clean_lines(lines):
     for line in lines:
         if not line or is_noise(line):
             continue
-        # Short lines without sentence punctuation are names, labels or buttons.
-        if len(line.split()) < 3 and not re.search(r"[.!?]$", line):
+        # A lowercase line after an unfinished one continues the sentence ("...outbreaking of" / "hantavirus").
+        continues = bool(kept) and not re.search(r"[.!?]$", kept[-1]) and (
+            line[0].islower() or (line.isupper() and kept[-1].isupper()))  # all-caps posts
+        # Other short lines without sentence punctuation are names, labels or buttons.
+        if len(line.split()) < 3 and not re.search(r"[.!?]$", line) and not continues:
             continue
         kept.append(line)
     return kept
@@ -79,7 +82,9 @@ def find_claim(lines):
 MAX_QUERY_WORDS = 8
 _STOPWORDS = frozenset("""a an the is are was were be been being am of to in on for with and or but that this
     these those it its as at by from has have had do does did will would can could should may might just
-    very so than then there their they them he she his her we our you your i me my""".split())
+    very so than then there their they them he she his her we our you your i me my
+    all any every over into onto out up about after before now new officially reportedly allegedly
+    apparently actually literally says said according""".split())
 _LEAD = re.compile(r"^(breaking|update|just in|urgent|alert)\s*[:!\-]\s*", re.I)
 _ATTRIBUTION = re.compile(
     r",?\s*\b(doctors|scientists|experts|researchers|officials|sources|reports?|studies|a study)\s+"

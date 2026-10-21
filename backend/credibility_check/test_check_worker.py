@@ -47,7 +47,7 @@ class ClaimTest(unittest.TestCase):
         self.assertEqual(clean_lines(lines), lines[2:4])
 
     def test_header_with_name_and_date(self):
-        self.assertEqual(clean_lines(["Jane Doe @janedoe · Sep 1", "Jane Doe @janedoe - 5m"]), [])
+        self.assertEqual(clean_lines(["Jane Doe @janedoe · Sep 1", "Jane Doe @janedoe - 5m", "@janedoe 2h"]), [])
 
     def test_long_display_name_is_removed(self):
         lines = ["Daily News Now", "@dailynewsnow · 2h", "5G towers are spreading the coronavirus,",
@@ -73,6 +73,15 @@ class ClaimTest(unittest.TestCase):
                  "and the posts kept coming for weeks after the election ended.",
                  "California struggles for over a month to tally its ballots, published on Instagram 19 Aug 2026."]
         self.assertEqual(find_claim(lines), "California Took Over a Month To Count 95% of its Ballots.")
+
+    def test_one_word_continuation_line_is_kept(self):
+        lines = ["Post", "Mega-Politics", "...", "@_MegaPolitics", "Breaking:",
+                 "China officially bans all the US citizens to enter the country over outbreaking of", "hantavirus"]
+        claim = find_claim(lines)
+        self.assertTrue(claim.endswith("outbreaking of hantavirus"))
+        self.assertEqual(search_query(claim), "China bans US citizens enter country outbreaking hantavirus")
+        caps = ["SPOTIFY HAS REMOVED ED SHEERANS SONGS FROM THE", "PLATFORM"]
+        self.assertEqual(find_claim(caps), "SPOTIFY HAS REMOVED ED SHEERANS SONGS FROM THE PLATFORM")
 
     def test_no_claim_without_a_full_sentence(self):
         self.assertIsNone(find_claim(["Jane Doe", "@janedoe", "lol", "1.2K Likes"]))
@@ -100,6 +109,11 @@ class ScoringTest(unittest.TestCase):
     def test_one_site_counts_once(self):
         r = score_evidence([self.ev("snopes.com", "REFUTES"), self.ev("snopes.com", "REFUTES")])
         self.assertEqual((r["verdict"], r["refuters"]), ("UNVERIFIED", 1))
+
+    def test_mixed_ratings_pull_toward_the_middle(self):
+        r = score_evidence([self.ev("politifact.com", "MIXED"), self.ev("snopes.com", "REFUTES")])
+        self.assertEqual((r["verdict"], r["score"], r["refuters"]), ("UNVERIFIED", 25, 1))
+        self.assertEqual(score_evidence([self.ev("politifact.com", "MIXED")])["score"], 50)
 
     def test_unknown_sites_are_ignored(self):
         r = score_evidence([self.ev("random.blog", "SUPPORTS", 0), self.ev("x.example", "SUPPORTS", 0)])

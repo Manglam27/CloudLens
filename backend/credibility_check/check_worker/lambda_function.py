@@ -18,7 +18,7 @@ Pipeline:
 
 Configuration (Lambda environment variables):
     CHECKS_TABLE, CACHE_TABLE, SOURCES_TABLE, BUCKET_NAME
-    T_TRUE=70, T_FALSE=30, MAX_RESULTS=5   verdict limits and result budget
+    T_TRUE=70, T_FALSE=30, MIN_SOURCES=2, MAX_RESULTS=5   verdict limits and result budget
     EVIDENCE_ENABLED=true                  turns steps 3 and 4 on
     GDELT_ENABLED=true                     the keyless GDELT provider
     MODEL_ID                               Bedrock model, default Claude Haiku 4.5
@@ -153,8 +153,9 @@ def explain(lines, kind, claim, problem, sources, scored, reason):
     if not sources:
         return "No trusted fact-checks or news reports about this claim were found yet, so the score stays neutral."
     if scored["verdict"] not in (TRUE, FALSE) and scored["supporters"] + scored["refuters"]:
+        needed = int(os.environ.get("MIN_SOURCES", "2"))
         reason = (reason + " " if reason else "") + (
-            "Fewer than 2 independent trusted sources agree, so the claim stays Unverified.")
+            f"Fewer than {needed} independent trusted sources agree, so the claim stays Unverified.")
     return reason
 
 
@@ -183,7 +184,8 @@ def lambda_handler(event, context):
                 problem, complete = "Evidence search is not enabled yet, so this claim cannot be verified.", False
             else:
                 enabled = [name for name, _, _ in evidence.PROVIDERS if name != "gdelt" or gdelt_enabled]
-                sources, report = evidence.find_evidence(query, _api_keys(), _trusted_sources(), max_results, enabled)
+                sources, report = evidence.find_evidence(query, _api_keys(), _trusted_sources(), max_results, enabled,
+                                                         also_try=[claim])
                 if report.get(evidence.PRIMARY) != "ok":
                     complete = False  # the main fact-check source was missing or failed
                     if not sources and report.get(evidence.PRIMARY) == "skipped":
@@ -202,7 +204,8 @@ def lambda_handler(event, context):
                 reason, complete = evidence.summarize(sources, stances), False
         scored = score_evidence(
             [{"domain": s["domain"], "weight": s["weight"], "stance": st} for s, st in zip(sources, stances)],
-            int(os.environ.get("T_TRUE", "70")), int(os.environ.get("T_FALSE", "30")))
+            int(os.environ.get("T_TRUE", "70")), int(os.environ.get("T_FALSE", "30")),
+            int(os.environ.get("MIN_SOURCES", "2")))
         # Off-topic search results are not shown.
         shown = [(s, st) for s, st in zip(sources, stances) if st != "UNRELATED"]
         checked = bool(claim) and kind == "claim" and not problem

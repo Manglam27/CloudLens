@@ -92,11 +92,40 @@ def _item(kind, provider, url, title, sources, publisher="", rating="", summary=
             "claim_reviewed": claim_reviewed or "", "weight": sources.weight(domain)}
 
 
-def google_fact_check(query, key, sources, limit):
-    params = urllib.parse.urlencode({"query": query, "languageCode": "en", "pageSize": 10, "key": key})
-    data = _http_get_json(f"https://factchecktools.googleapis.com/v1alpha1/claims:search?{params}")
+SHORT_QUERY_WORDS = 4
+
+
+def short_query(query):
+    """The most distinctive words: names and numbers first, then the longest words, in their original order."""
+    words = query.split()
+    ranked = sorted(range(len(words)),
+                    key=lambda i: (not (words[i][:1].isupper() or any(c.isdigit() for c in words[i])), -len(words[i])))
+    return " ".join(words[i] for i in sorted(ranked[:SHORT_QUERY_WORDS]))
+
+
+def google_fact_check(queries, key, sources, limit):
+    """queries: one search, or several phrasings of it; their results are merged."""
+    def search(q):
+        params = urllib.parse.urlencode({"query": q, "languageCode": "en", "pageSize": 10, "key": key})
+        return _http_get_json(f"https://factchecktools.googleapis.com/v1alpha1/claims:search?{params}")
+
+    queries = [queries] if isinstance(queries, str) else list(queries)
+    # The search is picky about wording and its results vary between calls, so
+    # several phrasings run together, the last being the few most distinctive words.
+    queries = list(dict.fromkeys(q for q in queries + [short_query(queries[0])] if q))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(queries)) as pool:
+        futures = [pool.submit(search, q) for q in queries]
+        results = []
+        for future in futures:
+            try:
+                results.append(future.result())
+            except EvidenceError as e:
+                print(f"fact-check search failed: {e}")
+    if not results:
+        raise EvidenceError("every fact-check search failed")
+    print(f"fact-check searches: {[len(r.get('claims', [])) for r in results]} results")
     items = []
-    for claim in data.get("claims", []):
+    for claim in (c for r in results for c in r.get("claims", [])):
         for review in claim.get("claimReview", []):
             publisher = review.get("publisher") or {}
             items.append(_item("fact_check", "google_fact_check", review.get("url", ""), review.get("title"),
@@ -145,10 +174,11 @@ PROVIDERS = [("google_fact_check", google_fact_check, True), ("newsapi", newsapi
 PRIMARY = "google_fact_check"
 
 
-def find_evidence(query, keys, sources, limit, enabled=None):
+def find_evidence(query, keys, sources, limit, enabled=None, also_try=()):
     """Searches every usable provider in parallel.
 
     keys maps provider name to its API key (missing or empty means skip it).
+    also_try: other phrasings for the fact-check search when `query` finds nothing.
     Returns (up to `limit` trusted items, fact-checks first, then by weight;
              {provider: "ok" | "failed" | "skipped"}).
     """
@@ -158,7 +188,8 @@ def find_evidence(query, keys, sources, limit, enabled=None):
             if (enabled is not None and name not in enabled) or (needs_key and not keys.get(name)):
                 report[name] = "skipped"
                 continue
-            futures[pool.submit(search, query, keys.get(name), sources, limit)] = name
+            queries = [query, *also_try] if name == PRIMARY else query
+            futures[pool.submit(search, queries, keys.get(name), sources, limit)] = name
         found = []
         for future in concurrent.futures.as_completed(futures):
             name = futures[future]
@@ -187,11 +218,27 @@ _WORD = re.compile(r"[a-z0-9%$]+")
 _COMMON = frozenset("the and for with that this are was were has have had from but not you its our their".split())
 
 
+# Different names fact-checkers use for the same thing.
+_SYNONYMS = {"coronavirus": "covid", "sars": "covid", "us": "usa", "america": "usa", "american": "usa"}
+
+
+def _stem(word):
+    """Crude stemming so "ballots", "spreading" and "banned" match "ballot", "spread" and "ban"."""
+    for suffix in ("ing", "ed", "s"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            word = word[:-len(suffix)]
+            if len(word) > 3 and word[-1] == word[-2] and word[-1] not in "aeiouls":
+                word = word[:-1]  # "bann" -> "ban"
+            break
+    return word
+
+
 def _keywords(text):
     words = _WORD.findall(re.sub(r"['’]s\b", "", (text or "").lower()))
-    # Crude stemming so "ballots" matches "ballot".
-    return {w[:-1] if len(w) > 3 and w.endswith("s") else w
-            for w in words if (len(w) > 2 or w.isdigit()) and w not in _COMMON}
+    words = (_SYNONYMS.get(w, w) for w in words)
+    # Short words count only when they carry a digit, like "5g".
+    return {_SYNONYMS.get(_stem(w), _stem(w)) for w in words
+            if (len(w) > 2 or any(c.isdigit() for c in w)) and w not in _COMMON}
 
 
 def relevance(query, item):
@@ -206,16 +253,23 @@ def relevance(query, item):
 # Rule-based stances, used only when Claude is unavailable. Besides Claude's
 # SUPPORTS / REFUTES / UNRELATED they use MIXED (a fact-check with an in-between
 # rating) and RELATED (on topic, but no clear side). Only SUPPORTS and REFUTES count.
-_MIXED = re.compile(r"half|mix|partly|partially|unproven|unverified|missing context|lacks context|satire|outdated|"
-                    r"no evidence either|disputed", re.I)
+_MIXED = re.compile(r"half|mix|partly|partially|unproven|unverified|outdated|exaggerat|no evidence either|disputed",
+                    re.I)
+# Fact-checkers rate claims that are satire, out of context or never happened as not true as stated.
 _REFUTES = re.compile(r"false|fake|pants on fire|incorrect|inaccurate|misleading|fabricated|hoax|scam|not true|"
-                      r"wrong|debunk|baseless|no evidence|altered|manipulated|doctored|untrue|myth", re.I)
+                      r"wrong|debunk|baseless|no evidence|altered|manipulated|doctored|untrue|myth|"
+                      r"did ?n[o']t happen|never happened|not real|unfounded|unsupported|satire|parody|"
+                      r"missing context|lacks context|out of context|false context|miscaptioned|misattributed|"
+                      r"imposter|pinocchio|spoof|not connected|no connection|no link|not linked", re.I)
 _SUPPORTS = re.compile(r"\btrue\b|correct|accurate|confirmed|\breal\b|legit", re.I)
+# Fact-check headlines that say the claim is wrong: "Spotify Did NOT Remove...", "No, ...".
+_TITLE_REFUTES = re.compile(r"\b(did not|didn't|does not|doesn't|is not|isn't|was not|wasn't|has not|hasn't|"
+                            r"no evidence|false|fake|hoax|debunk\w*|myth)\b|^(fact check:\s*)?no\b", re.I)
 # Words that mean a news story questions the claim instead of reporting it as fact.
 _DOUBT = re.compile(r"\b(false|fake|hoax|debunk\w*|myths?|rumou?rs?|conspirac\w*|misleading|misinformation|"
                     r"disinformation|no evidence|viral|claims?|claimed|alleged\w*|denie[sd]|deny|not|isn't|fact.?check\w*)\b",
                     re.I)
-MIN_FACT_CHECK_RELEVANCE = 0.25
+MIN_FACT_CHECK_RELEVANCE = 0.4
 NEWS_SUPPORT_RELEVANCE = 0.7
 
 
@@ -226,15 +280,14 @@ def fallback_stance(item):
         rating = item.get("rating", "")
         if relevance < MIN_FACT_CHECK_RELEVANCE:
             return "UNRELATED"
-        if not rating:
-            return "RELATED"
         if _MIXED.search(rating):
             return "MIXED"
         if _REFUTES.search(rating):
             return "REFUTES"
         if _SUPPORTS.search(rating):
             return "SUPPORTS"
-        return "RELATED"
+        # No clear rating: a fact-check's headline usually states its finding.
+        return "REFUTES" if _TITLE_REFUTES.search(item.get("title", "")) else "RELATED"
     # Trusted outlets reporting the same thing as plain news back the claim up.
     if relevance >= NEWS_SUPPORT_RELEVANCE and not _DOUBT.search(f"{item['title']} {item['summary']}"):
         return "SUPPORTS"
@@ -245,13 +298,16 @@ def summarize(items, stances):
     """A plain one-line reason when Claude is unavailable."""
     refutes = sum(1 for s in stances if s == "REFUTES")
     supports = sum(1 for s in stances if s == "SUPPORTS")
-    others = sum(1 for s in stances if s in ("MIXED", "RELATED"))
+    mixed = sum(1 for s in stances if s == "MIXED")
+    others = sum(1 for s in stances if s == "RELATED")
     if supports and refutes:
         return "Trusted sources disagree about this claim."
     if refutes:
         return f"{refutes} trusted fact-check{'s' if refutes > 1 else ''} rated this claim false or misleading."
     if supports:
         return f"{supports} trusted source{'s' if supports > 1 else ''} back{'' if supports > 1 else 's'} up this claim."
+    if mixed:
+        return f"{mixed} trusted fact-check{'s' if mixed > 1 else ''} rated this claim partly true."
     if others:
         return (f"{others} trusted source{'s' if others > 1 else ''} discuss{'' if others > 1 else 'es'} this topic "
                 f"but {'do' if others > 1 else 'does'} not clearly confirm or refute the claim.")

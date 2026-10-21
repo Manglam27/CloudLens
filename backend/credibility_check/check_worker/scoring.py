@@ -10,11 +10,13 @@ MIN_INDEPENDENT_SOURCES = 2
 NEUTRAL_SCORE = 50  # no evidence either way
 
 
-def score_evidence(evidence, t_true=70, t_false=30):
+def score_evidence(evidence, t_true=70, t_false=30, min_sources=MIN_INDEPENDENT_SOURCES):
     """Returns {"verdict", "score", "supporters", "refuters"}; score is 50 without evidence."""
     trusted = [e for e in evidence if e.get("weight", 0) > 0]
-    s = sum(e["weight"] for e in trusted if e["stance"] == "SUPPORTS")
-    r = sum(e["weight"] for e in trusted if e["stance"] == "REFUTES")
+    # A mixed rating ("Half True") counts half for and half against.
+    m = sum(e["weight"] for e in trusted if e["stance"] == "MIXED") / 2
+    s = sum(e["weight"] for e in trusted if e["stance"] == "SUPPORTS") + m
+    r = sum(e["weight"] for e in trusted if e["stance"] == "REFUTES") + m
     # Independence: several articles from one site count as one source.
     supporters = len({e["domain"] for e in trusted if e["stance"] == "SUPPORTS"})
     refuters = len({e["domain"] for e in trusted if e["stance"] == "REFUTES"})
@@ -23,8 +25,8 @@ def score_evidence(evidence, t_true=70, t_false=30):
         return result
     score = round(100 * s / (s + r))
     result["score"] = score
-    if score >= t_true and supporters >= MIN_INDEPENDENT_SOURCES:
+    if score >= t_true and supporters >= min_sources:
         result["verdict"] = TRUE
-    elif score <= t_false and refuters >= MIN_INDEPENDENT_SOURCES:
+    elif score <= t_false and refuters >= min_sources:
         result["verdict"] = FALSE
     return result

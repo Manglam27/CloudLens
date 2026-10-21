@@ -154,10 +154,18 @@ class EvidenceTest(unittest.TestCase):
     def test_rating_rules(self):
         cases = {"False": "REFUTES", "Pants on Fire!": "REFUTES", "Mostly False": "REFUTES", "Incorrect": "REFUTES",
                  "Not true": "REFUTES", "True": "SUPPORTS", "Mostly True": "SUPPORTS", "Correct": "SUPPORTS",
-                 "Half True": "MIXED", "Missing context": "MIXED", "Unproven": "MIXED", "": "RELATED"}
+                 "Didn't Happen": "REFUTES", "Labeled Satire": "REFUTES", "Missing context": "REFUTES",
+                 "Unfounded": "REFUTES", "Miscaptioned": "REFUTES",
+                 "Half True": "MIXED", "Unproven": "MIXED", "Exaggerated": "MIXED", "": "RELATED"}
         for rating, expected in cases.items():
             with self.subTest(rating=rating):
                 self.assertEqual(evidence.fallback_stance({"kind": "fact_check", "rating": rating}), expected)
+        # Without a clear rating the headline decides.
+        self.assertEqual(evidence.fallback_stance({"kind": "fact_check", "rating": "See article",
+                                                   "title": "Fact Check: Spotify Did NOT Remove Ed Sheeran's Songs"}),
+                         "REFUTES")
+        self.assertEqual(evidence.fallback_stance({"kind": "fact_check", "rating": "See article",
+                                                   "title": "Did Spotify remove Ed Sheeran's music?"}), "RELATED")
         off_topic = {"kind": "fact_check", "rating": "False", "relevance": 0.1}
         self.assertEqual(evidence.fallback_stance(off_topic), "UNRELATED")
 
@@ -176,6 +184,44 @@ class EvidenceTest(unittest.TestCase):
         item = {"title": "California's ballot count", "summary": "", "claim_reviewed": ""}
         self.assertEqual(evidence.relevance("California ballots", item), 1.0)
         self.assertEqual(evidence.relevance("Florida ballots", item), 0.5)
+
+    def test_relevance_matches_word_forms_short_names_and_synonyms(self):
+        item = {"title": "No, 5G does not spread COVID-19", "summary": "",
+                "claim_reviewed": "China banned American citizens"}
+        self.assertEqual(evidence.relevance("5G towers spreading coronavirus", item), 0.75)
+        self.assertEqual(evidence.relevance("China bans US citizens", item), 1.0)
+
+    def test_google_searches_several_phrasings_and_merges_them(self):
+        claim = "California Took Over a Month To Count 95% of its Ballots."
+        afp = review("factcheck.afp.com", "Missing context", claimed="California took over a month to count ballots")
+        politifact = review("politifact.com", "False", claimed="California ballots took a month to count")
+        found = {claim: [afp], "California Month Count Ballots": [afp, politifact]}
+        queries = []
+
+        def web(url, timeout=None, headers=None):
+            parse = evidence.urllib.parse
+            q = parse.parse_qs(parse.urlparse(url).query)["query"][0]
+            queries.append(q)
+            return {"claims": found.get(q, [])}
+
+        evidence._http_get_json = web
+        items, _ = evidence.find_evidence("California Took Month Count 95% Ballots", {"google_fact_check": "G"},
+                                          seed_sources(), 5, enabled=["google_fact_check"], also_try=[claim])
+        self.assertEqual(sorted(queries), sorted(["California Took Month Count 95% Ballots", claim,
+                                                  "California Month Count Ballots"]))
+        self.assertEqual(sorted(i["domain"] for i in items), ["factcheck.afp.com", "politifact.com"])  # no duplicates
+
+    def test_one_failed_phrasing_does_not_fail_the_search(self):
+        def web(url, timeout=None, headers=None):
+            if "hantavirus" not in url:
+                raise evidence.EvidenceError("HTTP 500")
+            return {"claims": [review("fullfact.org", "False")]}
+
+        evidence._http_get_json = web
+        items, report = evidence.find_evidence("China bans US citizens enter country outbreaking hantavirus",
+                                               {"google_fact_check": "G"}, seed_sources(), 5,
+                                               enabled=["google_fact_check"], also_try=["China bans US citizens"])
+        self.assertEqual((len(items), report["google_fact_check"]), (1, "ok"))
 
     def test_off_topic_news_is_dropped(self):
         self.web.responses = {"content.guardianapis.com": {"response": {"status": "ok", "results": [
