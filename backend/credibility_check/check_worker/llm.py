@@ -98,14 +98,15 @@ def extract_claim(lines):
     return result
 
 
-JUDGE_SYSTEM = """You compare a claim with sources found for it. There are two kinds of source:
+JUDGE_SYSTEM = """You compare a claim with sources found for it. There are three kinds of source:
 - a fact-check, with the claim it reviewed, its title and its rating;
-- a news article, with its headline and a short summary.
+- a news article, with its headline and a short summary;
+- an encyclopedia article, with its opening text.
 Judge only from these fields, not from your own knowledge.
 
 For each numbered source, decide its stance toward the claim:
 - SUPPORTS: a fact-check of the same claim that rates it true, mostly true, or correct; or a news article that \
-reports the claim as established fact.
+reports the claim as established fact; or an encyclopedia article whose text states the claim as a current fact.
 - REFUTES: a fact-check of the same claim that rates it false, mostly false, fabricated, or misleading; or a news \
 article that reports the claim as false or debunked.
 - UNRELATED: a source about a different claim, a mixed or unclear rating (for example half true, unproven, or \
@@ -145,6 +146,9 @@ def judge_sources(claim, sources):
                     f"Claim reviewed: {s.get('claim_reviewed') or '(not given)'}\nTitle: {s['title']}\n"
                     f"Rating: {s.get('rating') or '(none; see title and summary)'}\n"
                     f"Summary: {s.get('summary') or '(none)'}")
+        if s.get("kind") == "reference":
+            return (f"[{i}] Encyclopedia article from {s['publisher']}: {s['title']}\n"
+                    f"Opening text: {s.get('summary') or '(none)'}")
         return (f"[{i}] News article from {s['publisher']} ({s['domain']})\n"
                 f"Headline: {s['title']}\nSummary: {s.get('summary') or '(none)'}")
 

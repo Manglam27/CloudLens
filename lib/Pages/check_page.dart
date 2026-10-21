@@ -199,9 +199,9 @@ class _CheckPageState extends State<CheckPage> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text('0 · False', style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
-              Text('50 · No evidence either way', style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
-              Text('100 · True', style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
+              Text('0–30 False', style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
+              Text('35–65 Unverified', style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
+              Text('70–100 True', style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
             ],
           ),
         ],

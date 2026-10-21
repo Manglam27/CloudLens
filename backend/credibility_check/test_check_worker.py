@@ -83,6 +83,19 @@ class ClaimTest(unittest.TestCase):
         caps = ["SPOTIFY HAS REMOVED ED SHEERANS SONGS FROM THE", "PLATFORM"]
         self.assertEqual(find_claim(caps), "SPOTIFY HAS REMOVED ED SHEERANS SONGS FROM THE PLATFORM")
 
+    def test_lowercase_posts_are_claims_but_menus_are_not(self):
+        lines = ["Gir Chris", "Subscribe", "@eagleseyeinc",
+                 "sleeping with a fan on is extremely dangerous and most people do it", "every single night.",
+                 "Hit me with the harshest reality truth."]
+        self.assertTrue(find_claim(lines).startswith("sleeping with a fan on"))
+        menu = ["colorado winter weather advisory sn AI Mode All News Images Videos Forums Shopp Colorado.",
+                "The National Weather Service has issued an advisory."]
+        self.assertEqual(find_claim(menu), "The National Weather Service has issued an advisory.")
+
+    def test_breaking_news_label_is_not_searched(self):
+        self.assertEqual(search_query("BREAKING NEWS: Adam Sandler has donated $5 million to homeless centers."),
+                         "Adam Sandler donated $5 million homeless centers")
+
     def test_no_claim_without_a_full_sentence(self):
         self.assertIsNone(find_claim(["Jane Doe", "@janedoe", "lol", "1.2K Likes"]))
 
@@ -109,10 +122,26 @@ class ScoringTest(unittest.TestCase):
     def test_one_fact_check_of_the_same_claim_decides(self):
         check = {"domain": "fullfact.org", "stance": "REFUTES", "weight": 1.0, "kind": "fact_check", "relevance": 0.9}
         self.assertEqual(score_evidence([check])["verdict"], "FALSE")
-        loose = {**check, "relevance": 0.5}
+        loose = {**check, "relevance": 0.4}
         self.assertEqual(score_evidence([loose])["verdict"], "UNVERIFIED")
         news = {**check, "domain": "cnn.com", "kind": "news", "stance": "SUPPORTS", "weight": 0.6}
         self.assertEqual(score_evidence([news])["verdict"], "UNVERIFIED")  # news needs 2 sites
+
+    def test_score_always_matches_the_verdict(self):
+        cases = [[self.ev("cnn.com", "SUPPORTS", 0.6)],                        # one outlet: leans true
+                 [self.ev("snopes.com", "REFUTES"), self.ev("bbc.com", "SUPPORTS", 0.6)],
+                 [self.ev("apnews.com", "SUPPORTS"), self.ev("reuters.com", "SUPPORTS")],
+                 [self.ev("snopes.com", "REFUTES"), self.ev("factcheck.org", "REFUTES")], []]
+        for evidence in cases:
+            r = score_evidence(evidence)
+            band = {"TRUE": (70, 100), "FALSE": (0, 30), "UNVERIFIED": (35, 65)}[r["verdict"]]
+            self.assertTrue(band[0] <= r["score"] <= band[1], (evidence, r))
+        self.assertEqual(score_evidence(cases[0])["score"], 65)  # not 100 with a single weak source
+
+    def test_an_encyclopedia_entry_can_confirm_but_not_refute(self):
+        wiki = {"domain": "wikipedia.org", "stance": "SUPPORTS", "weight": 0.6, "kind": "reference", "relevance": 1.0}
+        self.assertEqual(score_evidence([wiki])["verdict"], "TRUE")
+        self.assertEqual(score_evidence([{**wiki, "stance": "REFUTES"}])["verdict"], "UNVERIFIED")
 
     def test_one_site_counts_once(self):
         r = score_evidence([self.ev("snopes.com", "REFUTES"), self.ev("snopes.com", "REFUTES")])
@@ -120,7 +149,7 @@ class ScoringTest(unittest.TestCase):
 
     def test_mixed_ratings_pull_toward_the_middle(self):
         r = score_evidence([self.ev("politifact.com", "MIXED"), self.ev("snopes.com", "REFUTES")])
-        self.assertEqual((r["verdict"], r["score"], r["refuters"]), ("UNVERIFIED", 25, 1))
+        self.assertEqual((r["verdict"], r["balance"], r["score"], r["refuters"]), ("UNVERIFIED", 25, 42, 1))
         self.assertEqual(score_evidence([self.ev("politifact.com", "MIXED")])["score"], 50)
 
     def test_unknown_sites_are_ignored(self):

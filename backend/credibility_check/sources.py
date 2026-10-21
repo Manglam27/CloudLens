@@ -7,7 +7,7 @@
     python backend/credibility_check/sources.py set-weight bbc.com 0.8
     python backend/credibility_check/sources.py seed      add missing entries from trusted_sources.json
 
-Categories and their default weights: fact_checker 1.0, wire_service 1.0, news_outlet 0.6.
+Categories and their default weights: fact_checker 1.0, wire_service 1.0, news_outlet 0.6, reference 0.6.
 The worker picks up changes within 5 minutes; no redeploy is needed. Needs the AWS CLI signed in.
 """
 

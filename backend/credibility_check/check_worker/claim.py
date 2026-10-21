@@ -75,17 +75,25 @@ def find_claim(lines):
     candidates = [s for s in sentences if len(s.split()) >= MIN_CLAIM_WORDS]
     if not candidates:
         return None
-    clean = [s for s in candidates if not _TIMESTAMP.search(s) and not s[0].islower()]
+    clean = [s for s in candidates if not _TIMESTAMP.search(s) and not _looks_like_menu(s)]
     return (clean or candidates)[0][:MAX_CLAIM_CHARS]
 
 
-MAX_QUERY_WORDS = 8
+def _looks_like_menu(sentence):
+    """A search box run into menu labels: "colorado weather sn AI Mode All News Images Videos".
+    Posts written all in lowercase are fine; it's the lowercase start plus many capitalized labels."""
+    words = sentence.split()
+    labels = sum(1 for w in words[1:] if w[:1].isupper())
+    return sentence[0].islower() and labels >= 0.3 * len(words)
+
+
+MAX_QUERY_WORDS = 10
 _STOPWORDS = frozenset("""a an the is are was were be been being am of to in on for with and or but that this
     these those it its as at by from has have had do does did will would can could should may might just
     very so than then there their they them he she his her we our you your i me my
     all any every over into onto out up about after before now new officially reportedly allegedly
     apparently actually literally says said according""".split())
-_LEAD = re.compile(r"^(breaking|update|just in|urgent|alert)\s*[:!\-]\s*", re.I)
+_LEAD = re.compile(r"^(breaking( news)?|update|just in|urgent|alert)\s*[:!\-]\s*", re.I)
 _ATTRIBUTION = re.compile(
     r",?\s*\b(doctors|scientists|experts|researchers|officials|sources|reports?|studies|a study)\s+"
     r"(say|says|said|confirm|confirms|confirmed|warn|warns|show|shows|find|finds|found|claim|claims)\b", re.I)

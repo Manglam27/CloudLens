@@ -29,9 +29,11 @@ app ── POST /checks {imageKey} ──► Check API ── async ──► Ch
    words they share, at most 8, preferring different sites.
 4. **Judge:** Claude labels each source Supports, Refutes or Unrelated and writes
    the reason. Without Bedrock, rules read fact-check ratings ("False", "Didn't
-   Happen", "Missing context"...) and headlines ("...did NOT remove..."), and
-   count trusted news that reports the same thing, with the same names and no
-   doubt words, as support.
+   Happen", "Missing context"...) and headlines ("...did NOT remove..."), but
+   only for fact-checks that reviewed much the same claim with the same names.
+   Trusted news that reports the same thing, with the same names and no doubt
+   words, counts as support, and so does a Wikipedia sentence that states the
+   claim in the present tense in the main article about its subject.
 5. **Score:** see [Scoring](#scoring). A result is cached per image only when
    every step ran without a fallback.
 
@@ -42,6 +44,7 @@ app ── POST /checks {imageKey} ──► Check API ── async ──► Ch
 | Google Fact Check Tools API | `/cloudlens/google-factcheck-api-key` | Rated fact-checks; searched with three phrasings because its matching is picky |
 | Google News RSS | none | Fact-check articles and news reports from many outlets |
 | Bing News RSS | none | The same from Bing's index, with summaries |
+| Wikipedia API | none | Opening paragraphs of the articles the claim names, for settled facts ("the capital of Australia is Canberra") |
 | NewsAPI.org | `/cloudlens/newsapi-key` (optional) | News from trusted domains; free plan shows articles a day late |
 | The Guardian Content API | `/cloudlens/guardian-api-key` (optional) | Guardian reporting |
 
@@ -55,7 +58,8 @@ aws ssm put-parameter --region us-east-1 --name /cloudlens/google-factcheck-api-
 ## Trusted sources
 
 The `CloudLensTrustedSources` table lists the sites CloudLens trusts: 39
-fact-checkers and 10 wire services (weight 1.0) and 59 news outlets (weight 0.6).
+fact-checkers and 10 wire services (weight 1.0), and 59 news outlets and
+Wikipedia (weight 0.6).
 Any other site weighs 0 and is ignored. `deploy.py` seeds missing entries from
 `check_worker/trusted_sources.json` without overwriting edits. Manage the live
 table with `sources.py`; the worker picks up changes within 5 minutes:
@@ -69,14 +73,17 @@ python backend/credibility_check/sources.py set-weight example.org 0.8
 
 ## Scoring
 
-- **Score = 100 × S ÷ (S + R)**, where S and R add up the weights of supporting
-  and refuting sources; a mixed rating ("Half True") adds half to each. With no
-  evidence either way the score is a neutral **50**.
-- **True:** score ≥ 70, and either 2 independent sites support the claim or one
-  published fact-check of this same claim does.
-- **False:** score ≤ 30, and either 2 independent sites refute it or one
+- **Balance = 100 × S ÷ (S + R)**, where S and R add up the weights of
+  supporting and refuting sources; a mixed rating ("Half True") adds half to
+  each. With no evidence either way the balance is **50**.
+- **True:** balance ≥ 70, and either 2 independent sites support the claim or
+  one published fact-check or Wikipedia sentence states it.
+- **False:** balance ≤ 30, and either 2 independent sites refute it or one
   published fact-check of this same claim does.
 - **Unverified:** everything else.
+- **Score shown:** the balance for True (70–100) and False (0–30). For
+  Unverified it is squeezed into 35–65, so it never looks decided when the
+  verdict is not: above 50 the evidence leans true, below 50 false.
 
 ## API
 
