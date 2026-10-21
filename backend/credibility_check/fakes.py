@@ -37,6 +37,9 @@ class FakeTable:
         item.update(changes)
         self.history.append(changes)
 
+    def scan(self, **kwargs):
+        return {"Items": [copy.deepcopy(i) for i in self.items.values()]}
+
     def query(self, KeyConditionExpression, ExpressionAttributeValues, ScanIndexForward=True, Limit=None):
         m = re.fullmatch(r"(\w+) = (:\w+)", KeyConditionExpression)
         field, value = m.group(1), ExpressionAttributeValues[m.group(2)]

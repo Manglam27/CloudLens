@@ -195,6 +195,15 @@ class _CheckPageState extends State<CheckPage> {
             color: Verdict.color(check.verdict),
             backgroundColor: Colors.grey.shade300,
           ),
+          const SizedBox(height: 4),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text('0 · False', style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
+              Text('50 · No evidence either way', style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
+              Text('100 · True', style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
+            ],
+          ),
         ],
         const SizedBox(height: 24),
         if (check.claim != null) ...[
@@ -206,12 +215,41 @@ class _CheckPageState extends State<CheckPage> {
         const Text('Why', style: TextStyle(fontWeight: FontWeight.bold)),
         const SizedBox(height: 4),
         Text(check.reason ?? ''),
+        if (check.sources.isNotEmpty) ...[
+          const SizedBox(height: 16),
+          const Text('Sources', style: TextStyle(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 4),
+          for (final source in check.sources) _sourceTile(source),
+        ],
         if (check.cached) ...[
           const SizedBox(height: 16),
           Text('This screenshot was checked before, so the saved result is shown.',
               style: TextStyle(color: Colors.grey.shade600, fontSize: 12)),
         ],
       ],
+    );
+  }
+
+  Widget _sourceTile(CheckSource source) {
+    final (label, color) = switch (source.stance) {
+      'SUPPORTS' => ('Supports', Colors.green.shade700),
+      'REFUTES' => ('Refutes', Colors.red.shade700),
+      'MIXED' => ('Mixed', Colors.orange.shade800),
+      'RELATED' => ('Related', Colors.blueGrey.shade600),
+      _ => ('Unrelated', Colors.grey.shade600),
+    };
+    return Card(
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      child: ListTile(
+        dense: true,
+        title: Text(source.publisher, style: const TextStyle(fontWeight: FontWeight.bold)),
+        subtitle: Text(
+          [if (source.rating.isNotEmpty) 'Rated: ${source.rating}', source.title].join('\n'),
+          maxLines: 3,
+          overflow: TextOverflow.ellipsis,
+        ),
+        trailing: Text(label, style: TextStyle(color: color, fontWeight: FontWeight.bold)),
+      ),
     );
   }
 

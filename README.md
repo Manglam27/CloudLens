@@ -41,14 +41,13 @@ with no social-media integration.
 | --- | --- | --- |
 | Sign up with an e-mail verification code | FR 1.1 | Built |
 | Log in and log out | FR 1.2 | Built |
-| Reset a forgotten password by e-mail code | FR 1.2 | Planned |
+| Reset a forgotten password by e-mail code | FR 1.2 | Built |
 | Upload from the camera or gallery to a private cloud library | FR 1.3 | Built |
-| Request a credibility check, with live progress | FR 1.4 | Built (skeleton) |
-| View the verdict, score and reason | FR 1.5 | Built; every verdict is Unverified until evidence search is added |
+| Request a credibility check, with live progress | FR 1.4 | Built |
+| View the verdict, score, reason and the sources behind it | FR 1.5 | Built |
 | History of past checks, re-opened without running again | FR 1.6 | Built |
 | Edit photos with 12 filters running on AWS Lambda | — | Built |
 | Favorites, save to gallery, delete | — | Built |
-| Show the sources behind each verdict | — | Future, if time allows |
 
 ## How a credibility check works
 
@@ -56,13 +55,16 @@ with no social-media integration.
    on a local one. The server saves a job and returns at once; the app polls every
    2 seconds and shows the current step.
 2. **Read text:** Amazon Textract extracts the text lines from the screenshot.
-3. **Find the claim:** rules remove names, @handles, times and like counts.
-   *Planned:* one LLM call keeps the checkable statement, or returns none for
-   opinions and jokes.
-4. **Find evidence** *(planned)*: the Google Fact Check Tools API and a news search
-   limited to trusted sources, at most 5 results.
-5. **Judge the sources** *(planned)*: one LLM call labels each source Supports,
-   Refutes or Unrelated and writes a short reason.
+3. **Find the claim:** Claude Haiku 4.5 on Amazon Bedrock keeps the checkable
+   statement, or returns none for opinions and jokes. Rules that remove names,
+   @handles, times and like counts are the fallback.
+4. **Find evidence:** Google Fact Check Tools, Google News, Bing News, NewsAPI
+   and The Guardian are searched in parallel. Only sites in the trusted-source
+   table (108 fact-checkers, wire services and news outlets) count, at most 8
+   results.
+5. **Judge the sources:** Claude labels each source Supports, Refutes or
+   Unrelated and writes a short reason. Rules that read fact-check ratings and
+   headlines are the fallback.
 6. **Score:** the formula below gives the score and verdict, which are saved for
    history.
 
@@ -70,9 +72,12 @@ with no social-media integration.
 
 - Each source has a weight: **1.0** for fact-checkers and wire services, **0.6**
   for established news outlets. Unknown sites are ignored.
-- **Score = 100 × supporting weight ÷ (supporting + refuting weight)**
-- **True:** score ≥ 70 and at least 2 independent trusted sources support the claim.
-- **False:** score ≤ 30 and at least 2 independent trusted sources refute it.
+- **Score = 100 × supporting weight ÷ (supporting + refuting weight)**. A mixed
+  rating ("Half True") counts half each way; with no evidence the score is 50.
+- **True:** score ≥ 70, and at least 2 independent trusted sources support the
+  claim, or one published fact-check of this same claim does.
+- **False:** score ≤ 30, and at least 2 independent trusted sources refute it,
+  or one published fact-check of this same claim does.
 - **Unverified:** every other case, including too few sources, disagreement,
   opinions, or no evidence.
 
@@ -95,8 +100,8 @@ Flutter app ── login ───────────► Amazon Cognito (ac
                                                               ▼
                                                         Check worker Lambda
                                                           ├─ Amazon Textract (OCR)
-                                                          ├─ Amazon Bedrock, Claude (planned)
-                                                          └─ fact-check and news search APIs (planned)
+                                                          ├─ Amazon Bedrock, Claude Haiku 4.5
+                                                          └─ fact-check and news searches
 ```
 
 Only the extracted claim text is sent to the outside search services; photos
@@ -109,10 +114,10 @@ never leave AWS.
 | Response time | Result within 30 s of upload for a screenshot with up to about 100 words |
 | OCR accuracy | At least 95% of words read correctly on clear English screenshots |
 | Verdict accuracy | At least 75% agreement with published fact-check ratings on a test set of 100+ screenshots |
-| No guessing | Never True or False with fewer than 2 independent trusted sources |
+| No guessing | Never True or False without 2 independent trusted sources or a published fact-check of the claim |
 | Consistency | The same screenshot always returns the same verdict (cached results, fixed LLM settings) |
 | Privacy | Screenshots visible only to the uploader, deleted on request, never used for training |
-| Cost control | At most 5 search results and 1 verdict LLM call per check |
+| Cost control | At most 8 search results and 2 LLM calls (claim, verdict) per check |
 
 **Changes since the requirements were written:**
 - The server runs on AWS Lambda behind API Gateway instead of a FastAPI
@@ -124,24 +129,20 @@ never leave AWS.
 
 **Done**
 - Development environment, toolchain and a working app: sign-up with e-mail
-  verification, photo upload, cloud library, and editing on AWS Lambda.
-- Credibility check skeleton: Check button, live progress, result screen,
-  History tab, Textract OCR, claim rules and the scoring formula.
+  verification, password reset, photo upload, cloud library, and editing on AWS
+  Lambda.
+- Credibility check: Check button, live progress, result screen with sources,
+  History tab, Textract OCR, evidence search over five providers, a trusted-source
+  table, Claude claim and stance steps with rule fallbacks, and the scoring formula.
 
 **Next**
-1. Evidence search: Google Fact Check Tools API, and a news search limited to
-   trusted sources. API keys are kept in AWS SSM Parameter Store, never in code.
-2. Claim extraction and source judging with Claude Haiku 4.5 on Amazon Bedrock.
-3. Switch evidence search on, which also starts caching results per screenshot.
-4. Password reset by e-mail code (FR 1.2).
-5. Private per-user folders (`private/<identity id>/`) enforced by IAM, so S3
+1. Enable Anthropic model access on Amazon Bedrock for the account, so checks use
+   Claude instead of the rule fallbacks.
+2. Measure the OCR and verdict accuracy targets on a test set of 100+ screenshots.
+3. Private per-user folders (`private/<identity id>/`) enforced by IAM, so S3
    itself blocks access to other users' photos.
-6. Require sign-in on `/photoEdits`, like the `/checks` routes.
-7. Store favorites as photo keys instead of links that expire.
-8. Measure the OCR and verdict accuracy targets on a test set of 100+ screenshots.
-
-**Future, if time allows**
-- Show the links to the sources behind each verdict.
+4. Require sign-in on `/photoEdits`, like the `/checks` routes.
+5. Store favorites as photo keys instead of links that expire.
 
 ## Toolchain
 
@@ -175,7 +176,9 @@ never leave AWS.
    ```
 
 4. Backend: each Lambda has its own README with test, build and deploy steps,
-   in `backend/photo_edits/` and `backend/credibility_check/`.
+   in `backend/photo_edits/` and `backend/credibility_check/`. The credibility
+   check also needs a Google Fact Check Tools API key in SSM Parameter Store and
+   Anthropic model access on Amazon Bedrock; see its README.
 
 ## Project structure
 
@@ -190,6 +193,7 @@ lib/
     login.dart               Cognito sign-in
     signup.dart              Cognito registration
     confirm_signup.dart      E-mail verification code
+    reset_password.dart      Password reset by e-mail code
     main_page.dart           Home / navigation (Photos, History, Favorites, Camera)
     camera_page.dart         Live camera capture
     photos_page.dart         Local and cloud library: upload, check, edit, delete

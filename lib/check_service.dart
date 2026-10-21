@@ -64,6 +64,26 @@ class CheckException implements Exception {
   String toString() => message;
 }
 
+/// One fact-check used as evidence, with how it relates to the claim.
+class CheckSource {
+  final String publisher;
+  final String domain;
+  final String title;
+  final String rating;
+  final String stance; // SUPPORTS, REFUTES or UNRELATED
+
+  CheckSource({required this.publisher, required this.domain, required this.title, required this.rating,
+      required this.stance});
+
+  factory CheckSource.fromJson(Map<String, dynamic> json) => CheckSource(
+        publisher: json['publisher'] as String? ?? '',
+        domain: json['domain'] as String? ?? '',
+        title: json['title'] as String? ?? '',
+        rating: json['rating'] as String? ?? '',
+        stance: json['stance'] as String? ?? 'UNRELATED',
+      );
+}
+
 class CheckResult {
   final String checkId;
   final String status;
@@ -75,6 +95,7 @@ class CheckResult {
   final String? error;
   final DateTime? createdAt;
   final bool cached;
+  final List<CheckSource> sources;
 
   CheckResult({
     required this.checkId,
@@ -87,6 +108,7 @@ class CheckResult {
     this.error,
     this.createdAt,
     this.cached = false,
+    this.sources = const [],
   });
 
   bool get isDone => status == 'DONE';
@@ -106,5 +128,8 @@ class CheckResult {
         error: json['error'] as String?,
         createdAt: DateTime.tryParse(json['createdAt'] as String? ?? '')?.toLocal(),
         cached: json['cached'] as bool? ?? false,
+        sources: (json['sources'] as List<dynamic>? ?? [])
+            .map((s) => CheckSource.fromJson(s as Map<String, dynamic>))
+            .toList(),
       );
 }

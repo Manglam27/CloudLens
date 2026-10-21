@@ -6,27 +6,44 @@ is written to the Checks table, which drives the app's progress screen:
     QUEUED -> READING_TEXT -> FINDING_CLAIM -> SEARCHING_SOURCES -> SCORING -> DONE
                                                                    (or FAILED)
 
-Skeleton version: OCR (Amazon Textract), rule-based claim finding and the
-scoring formula run for real. Evidence search is switched off with
-EVIDENCE_ENABLED=false, so every verdict is Unverified until it is added.
+Pipeline:
+    1 read text    Amazon Textract
+    2 find claim   Claude finds the claim, or says it is an opinion, satire or
+                   nothing to check; the rules in claim.py are the fallback
+    3 evidence     Google Fact Check, Google News, Bing News, NewsAPI and The
+                   Guardian in parallel, trusted sources only (CloudLensTrustedSources table)
+    4 judge        Claude labels each source Supports, Refutes or Unrelated;
+                   without Claude, fact-check ratings and headlines are read by rules
+    5 score        Milestone 2 formula and verdict rules (scoring.py)
 
 Configuration (Lambda environment variables):
-    CHECKS_TABLE, CACHE_TABLE, BUCKET_NAME
-    T_TRUE=70, T_FALSE=30, MAX_RESULTS=5   verdict limits and result budget
-    EVIDENCE_ENABLED=false                 turns the evidence step on
-    MODEL_ID                               Bedrock model for the upcoming LLM steps
+    CHECKS_TABLE, CACHE_TABLE, SOURCES_TABLE, BUCKET_NAME
+    T_TRUE=70, T_FALSE=30, MIN_SOURCES=2, MAX_RESULTS=8   verdict limits and result budget
+    EVIDENCE_ENABLED=true                  turns steps 3 and 4 on
+    MODEL_ID                               Bedrock model, default Claude Haiku 4.5
+    FACTCHECK_KEY_PARAM, NEWSAPI_KEY_PARAM, GUARDIAN_KEY_PARAM
+                                           SSM SecureStrings holding provider API keys
 """
 
 import os
+import time
 import traceback
 from datetime import datetime, timezone
 
-from claim import find_claim
+import claim as rules
+import evidence
+import llm
 from scoring import FALSE, TRUE, score_evidence
 
 MAX_OCR_CHARS = 4000
+SOURCES_TTL_SECONDS = 300
+KEY_PARAMS = {"google_fact_check": "FACTCHECK_KEY_PARAM", "newsapi": "NEWSAPI_KEY_PARAM",
+              "guardian": "GUARDIAN_KEY_PARAM"}
 
 _textract = None
+_ssm = None
+_keys = {}
+_sources = None  # (loaded_at, TrustedSources)
 _tables = {}
 
 
@@ -61,31 +78,84 @@ def _update(key, **fields):
     )
 
 
+def _api_keys():
+    """Provider API keys from SSM. A missing key is retried on the next check, so adding one needs no redeploy."""
+    global _ssm
+    for provider, env_name in KEY_PARAMS.items():
+        name = os.environ.get(env_name)
+        if _keys.get(provider) or not name:
+            continue
+        if _ssm is None:
+            import boto3
+            _ssm = boto3.client("ssm")
+        try:
+            _keys[provider] = _ssm.get_parameter(Name=name, WithDecryption=True)["Parameter"]["Value"]
+        except Exception as e:
+            code = (getattr(e, "response", None) or {}).get("Error", {}).get("Code")
+            if code != "ParameterNotFound":
+                print(f"could not read {name}: {code or type(e).__name__}")
+    return dict(_keys)
+
+
+def _trusted_sources():
+    """The CloudLensTrustedSources table, refreshed every 5 minutes; the bundled list if it can't be read."""
+    global _sources
+    if _sources and time.time() - _sources[0] < SOURCES_TTL_SECONDS:
+        return _sources[1]
+    by_domain = {}
+    try:
+        table, kwargs = _table("SOURCES_TABLE"), {}
+        while True:
+            page = table.scan(**kwargs)
+            by_domain.update({item["domain"]: item for item in page.get("Items", [])})
+            if "LastEvaluatedKey" not in page:
+                break
+            kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+    except Exception:
+        traceback.print_exc()
+    if not by_domain:
+        by_domain = evidence.load_seed()
+    _sources = (time.time(), evidence.TrustedSources(by_domain))
+    return _sources[1]
+
+
 def read_text(bucket, key):
     """Step 1: OCR. Returns the text lines Textract found, top to bottom."""
     result = _textract_client().detect_document_text(Document={"S3Object": {"Bucket": bucket, "Name": key}})
     return [b["Text"] for b in result.get("Blocks", []) if b.get("BlockType") == "LINE" and b.get("Text")]
 
 
-def find_evidence(claim, max_results):
-    """Step 3: evidence search. Not part of the skeleton yet."""
-    return []
+def find_claim(lines):
+    """Step 2. Returns (kind, claim, search_query, used_claude)."""
+    try:
+        found = llm.extract_claim(lines)
+        claim = found["claim"].strip() or None
+        return found["kind"], claim, found["search_query"].strip() or (claim or ""), True
+    except llm.LLMError:
+        traceback.print_exc()
+        claim = rules.find_claim(lines)
+        query = rules.search_query(claim) if claim else ""
+        return ("claim" if claim else "no_claim"), claim, query, False
 
 
-def explain(lines, claim, evidence_enabled, scored):
+def explain(lines, kind, claim, problem, sources, scored, reason):
     if not lines:
         return "No readable text was found in this image."
+    if kind == "opinion":
+        return "This looks like an opinion, not a statement of fact, so it can't be fact-checked."
+    if kind == "satire":
+        return "This looks like satire or a joke, so it isn't fact-checked."
     if not claim:
         return "No checkable statement was found in the text."
-    if not evidence_enabled:
-        return "Evidence search is not enabled yet, so this claim cannot be verified."
-    if scored["verdict"] == TRUE:
-        return f"{scored['supporters']} independent trusted sources support this claim."
-    if scored["verdict"] == FALSE:
-        return f"{scored['refuters']} independent trusted sources refute this claim."
-    if scored["supporters"] + scored["refuters"] == 0:
-        return "No trusted sources were found for this claim."
-    return "Trusted sources disagree or there are too few of them to decide."
+    if problem:
+        return problem
+    if not sources:
+        return "No trusted fact-checks or news reports about this claim were found yet, so the score stays neutral."
+    if scored["verdict"] not in (TRUE, FALSE) and scored["supporters"] + scored["refuters"]:
+        needed = int(os.environ.get("MIN_SOURCES", "2"))
+        reason = (reason + " " if reason else "") + (
+            f"Fewer than {needed} independent trusted sources agree, so the claim stays Unverified.")
+    return reason
 
 
 def lambda_handler(event, context):
@@ -95,31 +165,60 @@ def lambda_handler(event, context):
         print(f"check not found: {key}")
         return
     evidence_enabled = os.environ.get("EVIDENCE_ENABLED", "false").lower() == "true"
+    max_results = int(os.environ.get("MAX_RESULTS", "8"))
     try:
         _update(key, status="READING_TEXT")
         lines = read_text(os.environ["BUCKET_NAME"], item["imageKey"])
 
         _update(key, status="FINDING_CLAIM")
-        claim = find_claim(lines) if lines else None
+        kind, claim, query, used_claude = find_claim(lines) if lines else ("no_claim", None, "", True)
+        # A result is cached only if every step it needed ran without a fallback.
+        complete = used_claude
 
         _update(key, status="SEARCHING_SOURCES")
-        evidence = []
-        if claim and evidence_enabled:
-            evidence = find_evidence(claim, int(os.environ.get("MAX_RESULTS", "5")))
+        sources, problem, report = [], None, {}
+        if claim and kind == "claim":
+            if not evidence_enabled:
+                problem, complete = "Evidence search is not enabled yet, so this claim cannot be verified.", False
+            else:
+                sources, report = evidence.find_evidence(query, _api_keys(), _trusted_sources(), max_results,
+                                                         also_try=[claim])
+                if report.get(evidence.PRIMARY) != "ok":
+                    complete = False  # the main fact-check source was missing or failed
+                    if not sources and report.get(evidence.PRIMARY) == "skipped":
+                        problem = "Fact-check search is not configured yet, so this claim cannot be verified."
+                    elif not sources:
+                        problem = "The fact-check search could not be completed. Please try again."
 
         _update(key, status="SCORING")
-        scored = score_evidence(evidence, int(os.environ.get("T_TRUE", "70")), int(os.environ.get("T_FALSE", "30")))
+        stances, reason = [], ""
+        if sources:
+            try:
+                stances, reason = llm.judge_sources(claim, sources)
+            except llm.LLMError:
+                traceback.print_exc()
+                stances = evidence.fallback_stances(sources)
+                reason, complete = evidence.summarize(sources, stances), False
+        scored = score_evidence(
+            [{"domain": s["domain"], "weight": s["weight"], "stance": st, "kind": s["kind"],
+              "relevance": s.get("relevance", 0)} for s, st in zip(sources, stances)],
+            int(os.environ.get("T_TRUE", "70")), int(os.environ.get("T_FALSE", "30")),
+            int(os.environ.get("MIN_SOURCES", "2")))
+        # Off-topic search results are not shown.
+        shown = [(s, st) for s, st in zip(sources, stances) if st != "UNRELATED"]
+        checked = bool(claim) and kind == "claim" and not problem
         result = {
             "verdict": scored["verdict"],
-            "score": scored["score"],
-            "reason": explain(lines, claim, evidence_enabled, scored),
+            "score": scored["score"] if checked else None,
+            "reason": explain(lines, kind, claim, problem, [s for s, _ in shown], scored, reason),
             "claim": claim,
-            "sources": [],
+            "sources": [{"kind": s["kind"], "publisher": s["publisher"], "domain": s["domain"], "url": s["url"],
+                         "title": s["title"], "rating": s["rating"], "stance": st}
+                        for s, st in shown],
         }
-        _update(key, **result, ocrText="\n".join(lines)[:MAX_OCR_CHARS], status="DONE", finishedAt=_now())
-        # Only cache real verdicts. Skeleton results would otherwise stay
-        # Unverified after evidence search is switched on.
-        if evidence_enabled:
+        _update(key, **result, kind=kind, providers=report, ocrText="\n".join(lines)[:MAX_OCR_CHARS],
+                status="DONE", finishedAt=_now())
+        if complete:
             _table("CACHE_TABLE").put_item(Item={"imageHash": item["imageHash"], **result})
     except Exception:
         traceback.print_exc()
