@@ -197,16 +197,17 @@ def lambda_handler(event, context):
                         problem = "The fact-check search could not be completed. Please try again."
 
         _update(key, status="SCORING")
-        stances, strengths, reason, judged_by = [], [], "", "rules"
+        stances, strengths, reason = [], [], ""
+        # The model, if it did every LLM step this check needed; otherwise the rules.
+        judged_by = os.environ.get("MODEL_ID", llm.DEFAULT_MODEL) if used_llm else "rules"
         if sources:
             try:
                 stances, strengths, reason = llm.judge_sources(claim, sources)
-                judged_by = os.environ.get("MODEL_ID", llm.DEFAULT_MODEL)
             except llm.LLMError:
                 traceback.print_exc()
                 stances = evidence.fallback_stances(sources)
                 strengths = [evidence.match_strength(s) for s in sources]
-                reason, complete = evidence.summarize(sources, stances), False
+                reason, complete, judged_by = evidence.summarize(sources, stances), False, "rules"
         scored = score_evidence(
             [{"domain": s["domain"], "weight": s["weight"], "stance": st, "kind": s["kind"], "strength": m}
              for s, st, m in zip(sources, stances, strengths)],
