@@ -28,7 +28,7 @@ from decimal import Decimal
 # Textract's synchronous API accepts images up to 10 MB.
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 HISTORY_LIMIT = 50
-RESULT_FIELDS = ("verdict", "score", "reason", "claim", "sources")
+RESULT_FIELDS = ("verdict", "score", "reason", "claim", "sources", "certainty", "judgedBy")
 PUBLIC_FIELDS = ("checkId", "status", "imageKey", "createdAt", "finishedAt", "cached", "error") + RESULT_FIELDS
 _CHECK_ID = re.compile(r"\d{13}-[0-9a-f]{8}")
 

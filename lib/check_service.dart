@@ -64,16 +64,18 @@ class CheckException implements Exception {
   String toString() => message;
 }
 
-/// One fact-check used as evidence, with how it relates to the claim.
+/// One source used as evidence, with how it relates to the claim.
 class CheckSource {
   final String publisher;
   final String domain;
   final String title;
   final String rating;
-  final String stance; // SUPPORTS, REFUTES or UNRELATED
+  final String stance; // SUPPORTS, REFUTES, MIXED or RELATED
+  final int? weight; // how much the site is trusted, 0-100
+  final int? strength; // how directly it settles the claim, 0-100
 
   CheckSource({required this.publisher, required this.domain, required this.title, required this.rating,
-      required this.stance});
+      required this.stance, this.weight, this.strength});
 
   factory CheckSource.fromJson(Map<String, dynamic> json) => CheckSource(
         publisher: json['publisher'] as String? ?? '',
@@ -81,6 +83,8 @@ class CheckSource {
         title: json['title'] as String? ?? '',
         rating: json['rating'] as String? ?? '',
         stance: json['stance'] as String? ?? 'UNRELATED',
+        weight: (json['weight'] as num?)?.toInt(),
+        strength: (json['strength'] as num?)?.toInt(),
       );
 }
 
@@ -96,6 +100,8 @@ class CheckResult {
   final DateTime? createdAt;
   final bool cached;
   final List<CheckSource> sources;
+  final int? certainty; // how much evidence there is, 0-100
+  final String? judgedBy; // the model that judged the sources, or "rules"
 
   CheckResult({
     required this.checkId,
@@ -109,6 +115,8 @@ class CheckResult {
     this.createdAt,
     this.cached = false,
     this.sources = const [],
+    this.certainty,
+    this.judgedBy,
   });
 
   bool get isDone => status == 'DONE';
@@ -131,5 +139,7 @@ class CheckResult {
         sources: (json['sources'] as List<dynamic>? ?? [])
             .map((s) => CheckSource.fromJson(s as Map<String, dynamic>))
             .toList(),
+        certainty: (json['certainty'] as num?)?.toInt(),
+        judgedBy: json['judgedBy'] as String?,
       );
 }
