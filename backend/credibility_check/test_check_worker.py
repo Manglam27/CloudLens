@@ -104,53 +104,70 @@ class ClaimTest(unittest.TestCase):
 
 
 class ScoringTest(unittest.TestCase):
-    def ev(self, domain, stance, weight=1.0):
-        return {"domain": domain, "stance": stance, "weight": weight}
+    def ev(self, domain, stance, weight=1.0, strength=1.0, kind="news"):
+        return {"domain": domain, "stance": stance, "weight": weight, "strength": strength, "kind": kind}
+
+    def check(self, domain, stance, strength=0.9):
+        return self.ev(domain, stance, strength=strength, kind="fact_check")
 
     def test_no_evidence_is_unverified_with_a_neutral_score(self):
-        self.assertEqual((score_evidence([])["verdict"], score_evidence([])["score"]), ("UNVERIFIED", 50))
+        r = score_evidence([])
+        self.assertEqual((r["verdict"], r["score"], r["certainty"]), ("UNVERIFIED", 50, 0))
+
+    def test_more_evidence_moves_the_score_further(self):
+        # Direction -1 every time; certainty grows with each fact-check: 0.59, 0.83, 0.93.
+        scores = [score_evidence([self.check(d, "REFUTES") for d in domains])["score"]
+                  for domains in (["snopes.com"], ["snopes.com", "politifact.com"],
+                                  ["snopes.com", "politifact.com", "fullfact.org"])]
+        self.assertEqual(scores, [20, 8, 3])
 
     def test_two_independent_supporters_make_it_true(self):
         r = score_evidence([self.ev("apnews.com", "SUPPORTS"), self.ev("reuters.com", "SUPPORTS")])
-        self.assertEqual((r["verdict"], r["score"]), ("TRUE", 100))
+        self.assertEqual((r["verdict"], r["score"]), ("TRUE", 93))
 
-    def test_two_independent_refuters_make_it_false(self):
+    def test_a_weak_supporter_pulls_a_false_claim_toward_the_middle(self):
         r = score_evidence([self.ev("snopes.com", "REFUTES"), self.ev("factcheck.org", "REFUTES"),
                             self.ev("bbc.com", "SUPPORTS", 0.6)])
-        self.assertEqual((r["verdict"], r["score"]), ("FALSE", 23))
+        self.assertEqual((r["verdict"], r["score"]), ("FALSE", 25))
 
     def test_one_fact_check_of_the_same_claim_decides(self):
-        check = {"domain": "fullfact.org", "stance": "REFUTES", "weight": 1.0, "kind": "fact_check", "relevance": 0.9}
-        self.assertEqual(score_evidence([check])["verdict"], "FALSE")
-        loose = {**check, "relevance": 0.4}
-        self.assertEqual(score_evidence([loose])["verdict"], "UNVERIFIED")
-        news = {**check, "domain": "cnn.com", "kind": "news", "stance": "SUPPORTS", "weight": 0.6}
-        self.assertEqual(score_evidence([news])["verdict"], "UNVERIFIED")  # news needs 2 sites
+        self.assertEqual(score_evidence([self.check("fullfact.org", "REFUTES")])["verdict"], "FALSE")
+        loose = score_evidence([self.check("fullfact.org", "REFUTES", strength=0.4)])
+        self.assertEqual((loose["verdict"], loose["score"]), ("UNVERIFIED", 34))
+        news = score_evidence([self.ev("cnn.com", "SUPPORTS", 0.6, strength=0.9)])
+        self.assertEqual((news["verdict"], news["score"]), ("UNVERIFIED", 69))  # news needs 2 sites
 
     def test_score_always_matches_the_verdict(self):
-        cases = [[self.ev("cnn.com", "SUPPORTS", 0.6)],                        # one outlet: leans true
-                 [self.ev("snopes.com", "REFUTES"), self.ev("bbc.com", "SUPPORTS", 0.6)],
+        cases = [[self.ev("cnn.com", "SUPPORTS", 0.6)],
+                 [self.check("snopes.com", "REFUTES"), self.ev("bbc.com", "SUPPORTS", 0.6)],
                  [self.ev("apnews.com", "SUPPORTS"), self.ev("reuters.com", "SUPPORTS")],
-                 [self.ev("snopes.com", "REFUTES"), self.ev("factcheck.org", "REFUTES")], []]
+                 [self.check("snopes.com", "REFUTES"), self.check("factcheck.org", "REFUTES")],
+                 [self.ev("snopes.com", "REFUTES"), self.ev("snopes.com", "REFUTES")], []]
         for evidence in cases:
             r = score_evidence(evidence)
-            band = {"TRUE": (70, 100), "FALSE": (0, 30), "UNVERIFIED": (35, 65)}[r["verdict"]]
+            band = {"TRUE": (70, 100), "FALSE": (0, 30), "UNVERIFIED": (31, 69)}[r["verdict"]]
             self.assertTrue(band[0] <= r["score"] <= band[1], (evidence, r))
-        self.assertEqual(score_evidence(cases[0])["score"], 65)  # not 100 with a single weak source
 
     def test_an_encyclopedia_entry_can_confirm_but_not_refute(self):
-        wiki = {"domain": "wikipedia.org", "stance": "SUPPORTS", "weight": 0.6, "kind": "reference", "relevance": 1.0}
+        wiki = self.ev("wikipedia.org", "SUPPORTS", 0.6, kind="reference")
         self.assertEqual(score_evidence([wiki])["verdict"], "TRUE")
         self.assertEqual(score_evidence([{**wiki, "stance": "REFUTES"}])["verdict"], "UNVERIFIED")
 
     def test_one_site_counts_once(self):
-        r = score_evidence([self.ev("snopes.com", "REFUTES"), self.ev("snopes.com", "REFUTES")])
-        self.assertEqual((r["verdict"], r["refuters"]), ("UNVERIFIED", 1))
+        one = score_evidence([self.ev("snopes.com", "REFUTES")])
+        two = score_evidence([self.ev("snopes.com", "REFUTES"), self.ev("snopes.com", "REFUTES")])
+        self.assertEqual((two["score"], two["refuters"]), (one["score"], 1))
 
     def test_mixed_ratings_pull_toward_the_middle(self):
         r = score_evidence([self.ev("politifact.com", "MIXED"), self.ev("snopes.com", "REFUTES")])
-        self.assertEqual((r["verdict"], r["balance"], r["score"], r["refuters"]), ("UNVERIFIED", 25, 42, 1))
+        self.assertEqual((r["for"], r["against"], r["verdict"]), (0.5, 1.5, "UNVERIFIED"))
         self.assertEqual(score_evidence([self.ev("politifact.com", "MIXED")])["score"], 50)
+
+    def test_weaker_matches_count_for_less(self):
+        strong = score_evidence([self.ev("apnews.com", "SUPPORTS", strength=1.0)])["score"]
+        weak = score_evidence([self.ev("apnews.com", "SUPPORTS", strength=0.3)])["score"]
+        self.assertGreater(strong, weak)
+        self.assertGreater(weak, 50)
 
     def test_unknown_sites_are_ignored(self):
         r = score_evidence([self.ev("random.blog", "SUPPORTS", 0), self.ev("x.example", "SUPPORTS", 0)])
@@ -163,8 +180,8 @@ class ScoringTest(unittest.TestCase):
 
     def test_thresholds_are_configurable(self):
         ev = [self.ev("apnews.com", "SUPPORTS"), self.ev("reuters.com", "SUPPORTS"), self.ev("bbc.com", "REFUTES", 0.6)]
-        self.assertEqual(score_evidence(ev)["verdict"], "TRUE")                   # 77 >= 70
-        self.assertEqual(score_evidence(ev, t_true=80)["verdict"], "UNVERIFIED")  # 77 < 80
+        self.assertEqual(score_evidence(ev)["verdict"], "TRUE")                   # 75 >= 70
+        self.assertEqual(score_evidence(ev, t_true=80)["verdict"], "UNVERIFIED")  # 75 < 80
 
 
 class WorkerTest(unittest.TestCase):
@@ -176,7 +193,8 @@ class WorkerTest(unittest.TestCase):
         self.checks.put_item({"userId": USER, "checkId": CHECK, "imageKey": f"{USER}_a.jpg", "imageHash": "h",
                               "status": "QUEUED"})
         worker._tables = {"checks": self.checks, "cache": self.cache}
-        worker.llm._client = None  # no Claude here: these tests cover the rule-based fallback
+        worker._keys = {}  # no LLM key here: these tests cover the rule-based fallback
+        worker.llm.set_api_key(None)
 
     def run_with(self, textract):
         worker._textract = textract

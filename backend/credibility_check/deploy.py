@@ -33,11 +33,12 @@ CACHE_TABLE = "CloudLensResultCache"
 SOURCES_TABLE = "CloudLensTrustedSources"
 API_FN, WORKER_FN = "cloudlens-check-api", "cloudlens-check-worker"
 AUTHORIZER = "cloudlens-cognito"
-MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"  # Claude Haiku 4.5, US inference profile
-# SecureStrings holding the evidence providers' API keys (worker env var -> SSM name). A team member
-# creates them; they are never stored in code. A provider whose key is missing is skipped.
+MODEL_ID = "nvidia/nemotron-3-ultra-550b-a55b"  # NVIDIA Nemotron 3 Ultra on build.nvidia.com
+# SecureStrings holding the API keys (worker env var -> SSM name). A team member creates them;
+# they are never stored in code. Without the NVIDIA key the rules judge; a provider without a key is skipped.
 #   aws ssm put-parameter --region us-east-1 --type SecureString --name <name> --value <key>
 KEY_PARAMS = {
+    "NVIDIA_KEY_PARAM": "/cloudlens/nvidia-api-key",                 # NVIDIA API catalog (the LLM)
     "FACTCHECK_KEY_PARAM": "/cloudlens/google-factcheck-api-key",  # Google Fact Check Tools API (main source)
     "NEWSAPI_KEY_PARAM": "/cloudlens/newsapi-key",                   # NewsAPI.org
     "GUARDIAN_KEY_PARAM": "/cloudlens/guardian-api-key",             # The Guardian Open Platform
@@ -200,10 +201,6 @@ def main():
         {"Effect": "Allow", "Action": ["dynamodb:PutItem"], "Resource": table(CACHE_TABLE)},
         {"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": photos},
         {"Effect": "Allow", "Action": ["textract:DetectDocumentText"], "Resource": "*"},
-        # Claude on Bedrock: the US inference profile, plus the model in each region it routes to.
-        {"Effect": "Allow", "Action": ["bedrock:InvokeModel"], "Resource": [
-            f"arn:aws:bedrock:{REGION}:{account}:inference-profile/{MODEL_ID}",
-            f"arn:aws:bedrock:*::foundation-model/{MODEL_ID.removeprefix('us.')}"]},
         {"Effect": "Allow", "Action": ["dynamodb:Scan"], "Resource": table(SOURCES_TABLE)},
         {"Effect": "Allow", "Action": ["ssm:GetParameter"],
          "Resource": [f"arn:aws:ssm:{REGION}:{account}:parameter{p}" for p in KEY_PARAMS.values()]},
@@ -214,7 +211,7 @@ def main():
     ensure_function(WORKER_FN, worker_role, HERE / "dist" / "check_worker.zip",
                     {**common, "SOURCES_TABLE": SOURCES_TABLE, "T_TRUE": "70", "T_FALSE": "30", "MIN_SOURCES": "2",
                      "MAX_RESULTS": "8", "EVIDENCE_ENABLED": "true", "MODEL_ID": MODEL_ID, **KEY_PARAMS},
-                    timeout=60, memory=512)
+                    timeout=120, memory=512)  # two LLM calls of up to 50 s each
     ensure_function(API_FN, api_role, HERE / "dist" / "check_api.zip",
                     {**common, "WORKER_FUNCTION": WORKER_FN}, timeout=10, memory=256)
 

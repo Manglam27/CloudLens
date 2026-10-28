@@ -200,7 +200,7 @@ class _CheckPageState extends State<CheckPage> {
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Text('0–30 False', style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
-              Text('35–65 Unverified', style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
+              Text('31–69 Unverified', style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
               Text('70–100 True', style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
             ],
           ),
@@ -215,6 +215,17 @@ class _CheckPageState extends State<CheckPage> {
         const Text('Why', style: TextStyle(fontWeight: FontWeight.bold)),
         const SizedBox(height: 4),
         Text(check.reason ?? ''),
+        if (check.certainty != null || check.judgedBy != null) ...[
+          const SizedBox(height: 8),
+          Text(
+            [
+              if (check.certainty != null) 'Evidence certainty: ${check.certainty}%',
+              if (check.judgedBy != null)
+                'Judged by: ${check.judgedBy == 'rules' ? 'keyword rules' : check.judgedBy!.split('/').last}',
+            ].join(' · '),
+            style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
+          ),
+        ],
         if (check.sources.isNotEmpty) ...[
           const SizedBox(height: 16),
           const Text('Sources', style: TextStyle(fontWeight: FontWeight.bold)),
@@ -244,8 +255,13 @@ class _CheckPageState extends State<CheckPage> {
         dense: true,
         title: Text(source.publisher, style: const TextStyle(fontWeight: FontWeight.bold)),
         subtitle: Text(
-          [if (source.rating.isNotEmpty) 'Rated: ${source.rating}', source.title].join('\n'),
-          maxLines: 3,
+          [
+            if (source.rating.isNotEmpty) 'Rated: ${source.rating}',
+            source.title,
+            if (source.strength != null && source.weight != null)
+              'Trust ${source.weight}% · Match ${source.strength}%',
+          ].join('\n'),
+          maxLines: 4,
           overflow: TextOverflow.ellipsis,
         ),
         trailing: Text(label, style: TextStyle(color: color, fontWeight: FontWeight.bold)),

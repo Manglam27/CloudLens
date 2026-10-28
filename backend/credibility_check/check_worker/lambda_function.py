@@ -8,21 +8,22 @@ is written to the Checks table, which drives the app's progress screen:
 
 Pipeline:
     1 read text    Amazon Textract
-    2 find claim   Claude finds the claim, or says it is an opinion, satire or
-                   nothing to check; the rules in claim.py are the fallback
-    3 evidence     Google Fact Check, Google News, Bing News, NewsAPI and The
-                   Guardian in parallel, trusted sources only (CloudLensTrustedSources table)
-    4 judge        Claude labels each source Supports, Refutes or Unrelated;
-                   without Claude, fact-check ratings and headlines are read by rules
-    5 score        Milestone 2 formula and verdict rules (scoring.py)
+    2 find claim   the LLM (NVIDIA Nemotron) finds the claim, or says it is an
+                   opinion, satire or nothing to check; the rules in claim.py are the fallback
+    3 evidence     Google Fact Check, Google News, Bing News, Wikipedia, NewsAPI and
+                   The Guardian in parallel, trusted sources only (CloudLensTrustedSources table)
+    4 judge        the LLM labels each source Supports, Refutes, Mixed or Unrelated
+                   and rates how directly it settles the claim; without the LLM,
+                   fact-check ratings, headlines and keyword matches are read by rules
+    5 score        direction and certainty of the evidence (scoring.py)
 
 Configuration (Lambda environment variables):
     CHECKS_TABLE, CACHE_TABLE, SOURCES_TABLE, BUCKET_NAME
     T_TRUE=70, T_FALSE=30, MIN_SOURCES=2, MAX_RESULTS=8   verdict limits and result budget
     EVIDENCE_ENABLED=true                  turns steps 3 and 4 on
-    MODEL_ID                               Bedrock model, default Claude Haiku 4.5
-    FACTCHECK_KEY_PARAM, NEWSAPI_KEY_PARAM, GUARDIAN_KEY_PARAM
-                                           SSM SecureStrings holding provider API keys
+    MODEL_ID                               NVIDIA model, default Nemotron 3 Ultra
+    NVIDIA_KEY_PARAM, FACTCHECK_KEY_PARAM, NEWSAPI_KEY_PARAM, GUARDIAN_KEY_PARAM
+                                           SSM SecureStrings holding the API keys
 """
 
 import os
@@ -37,8 +38,8 @@ from scoring import FALSE, TRUE, score_evidence
 
 MAX_OCR_CHARS = 4000
 SOURCES_TTL_SECONDS = 300
-KEY_PARAMS = {"google_fact_check": "FACTCHECK_KEY_PARAM", "newsapi": "NEWSAPI_KEY_PARAM",
-              "guardian": "GUARDIAN_KEY_PARAM"}
+KEY_PARAMS = {"nvidia": "NVIDIA_KEY_PARAM", "google_fact_check": "FACTCHECK_KEY_PARAM",
+              "newsapi": "NEWSAPI_KEY_PARAM", "guardian": "GUARDIAN_KEY_PARAM"}
 
 _textract = None
 _ssm = None
@@ -126,7 +127,7 @@ def read_text(bucket, key):
 
 
 def find_claim(lines):
-    """Step 2. Returns (kind, claim, search_query, used_claude)."""
+    """Step 2. Returns (kind, claim, search_query, used_llm)."""
     try:
         found = llm.extract_claim(lines)
         claim = found["claim"].strip() or None
@@ -151,14 +152,12 @@ def explain(lines, kind, claim, problem, sources, scored, reason):
         return problem
     if not sources:
         return "No trusted fact-checks, news reports or reference articles about this claim were found yet."
-    if scored["verdict"] not in (TRUE, FALSE) and scored["supporters"] + scored["refuters"]:
-        needed = int(os.environ.get("MIN_SOURCES", "2"))
-        if scored["balance"] == 50:
+    if scored["verdict"] not in (TRUE, FALSE) and scored["for"] + scored["against"]:
+        if scored["score"] == 50:
             tail = "The sources disagree, so the claim stays Unverified."
         else:
-            lean = "true" if scored["balance"] > 50 else "false"
-            tail = (f"The evidence leans {lean}, but a verdict needs {needed} independent trusted sources "
-                    "that agree, or a published fact-check of this claim.")
+            lean = "true" if scored["score"] > 50 else "false"
+            tail = f"The evidence leans {lean}, but it is not strong enough for a verdict yet."
         reason = (reason + " " if reason else "") + tail
     return reason
 
@@ -174,11 +173,13 @@ def lambda_handler(event, context):
     try:
         _update(key, status="READING_TEXT")
         lines = read_text(os.environ["BUCKET_NAME"], item["imageKey"])
+        keys = _api_keys()
+        llm.set_api_key(keys.get("nvidia"))
 
         _update(key, status="FINDING_CLAIM")
-        kind, claim, query, used_claude = find_claim(lines) if lines else ("no_claim", None, "", True)
+        kind, claim, query, used_llm = find_claim(lines) if lines else ("no_claim", None, "", True)
         # A result is cached only if every step it needed ran without a fallback.
-        complete = used_claude
+        complete = used_llm
 
         _update(key, status="SEARCHING_SOURCES")
         sources, problem, report = [], None, {}
@@ -186,7 +187,7 @@ def lambda_handler(event, context):
             if not evidence_enabled:
                 problem, complete = "Evidence search is not enabled yet, so this claim cannot be verified.", False
             else:
-                sources, report = evidence.find_evidence(query, _api_keys(), _trusted_sources(), max_results,
+                sources, report = evidence.find_evidence(query, keys, _trusted_sources(), max_results,
                                                          also_try=[claim])
                 if report.get(evidence.PRIMARY) != "ok":
                     complete = False  # the main fact-check source was missing or failed
@@ -196,30 +197,37 @@ def lambda_handler(event, context):
                         problem = "The fact-check search could not be completed. Please try again."
 
         _update(key, status="SCORING")
-        stances, reason = [], ""
+        stances, strengths, reason = [], [], ""
+        # The model, if it did every LLM step this check needed; otherwise the rules.
+        judged_by = os.environ.get("MODEL_ID", llm.DEFAULT_MODEL) if used_llm else "rules"
         if sources:
             try:
-                stances, reason = llm.judge_sources(claim, sources)
+                stances, strengths, reason = llm.judge_sources(claim, sources)
             except llm.LLMError:
                 traceback.print_exc()
                 stances = evidence.fallback_stances(sources)
-                reason, complete = evidence.summarize(sources, stances), False
+                strengths = [evidence.match_strength(s) for s in sources]
+                reason, complete, judged_by = evidence.summarize(sources, stances), False, "rules"
         scored = score_evidence(
-            [{"domain": s["domain"], "weight": s["weight"], "stance": st, "kind": s["kind"],
-              "relevance": s.get("relevance", 0)} for s, st in zip(sources, stances)],
+            [{"domain": s["domain"], "weight": s["weight"], "stance": st, "kind": s["kind"], "strength": m}
+             for s, st, m in zip(sources, stances, strengths)],
             int(os.environ.get("T_TRUE", "70")), int(os.environ.get("T_FALSE", "30")),
             int(os.environ.get("MIN_SOURCES", "2")))
         # Off-topic search results are not shown.
-        shown = [(s, st) for s, st in zip(sources, stances) if st != "UNRELATED"]
+        shown = [(s, st, m) for s, st, m in zip(sources, stances, strengths) if st != "UNRELATED"]
         checked = bool(claim) and kind == "claim" and not problem
         result = {
             "verdict": scored["verdict"],
             "score": scored["score"] if checked else None,
-            "reason": explain(lines, kind, claim, problem, [s for s, _ in shown], scored, reason),
+            "reason": explain(lines, kind, claim, problem, [s for s, _, _ in shown], scored, reason),
             "claim": claim,
+            # Weights, strengths and certainty as percentages: DynamoDB does not store floats.
             "sources": [{"kind": s["kind"], "publisher": s["publisher"], "domain": s["domain"], "url": s["url"],
-                         "title": s["title"], "rating": s["rating"], "stance": st}
-                        for s, st in shown],
+                         "title": s["title"], "rating": s["rating"], "stance": st,
+                         "weight": round(s["weight"] * 100), "strength": round(m * 100)}
+                        for s, st, m in shown],
+            "certainty": round(scored["certainty"] * 100),
+            "judgedBy": judged_by,
         }
         _update(key, **result, kind=kind, providers=report, ocrText="\n".join(lines)[:MAX_OCR_CHARS],
                 status="DONE", finishedAt=_now())

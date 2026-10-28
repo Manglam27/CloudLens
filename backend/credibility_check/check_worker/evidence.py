@@ -460,9 +460,9 @@ def _match_sentence(query, claim, names, item):
     item["tense_ok"] = bool(_PAST.search(claim)) or not _PAST.search(best)
 
 
-# Rule-based stances, used only when Claude is unavailable. Besides Claude's
-# SUPPORTS / REFUTES / UNRELATED they use MIXED (a fact-check with an in-between
-# rating) and RELATED (on topic, but no clear side). Only SUPPORTS and REFUTES count.
+# Rule-based stances, used only when the LLM is unavailable. Besides the LLM's
+# SUPPORTS / REFUTES / MIXED / UNRELATED they use RELATED (on topic, but no clear
+# side), which, like UNRELATED, does not count toward the score.
 _MIXED = re.compile(r"half|mix|partly|partially|unproven|unverified|outdated|exaggerat|no evidence either|disputed",
                     re.I)
 # Fact-checkers rate claims that are satire, out of context or never happened as not true as stated.
@@ -536,6 +536,19 @@ def fallback_stance(item):
     return "RELATED" if relevance >= MIN_RELEVANCE else "UNRELATED"
 
 
+def match_strength(item):
+    """How directly a source settles the claim (0 to 1) when the rules judge it: how
+    alike a fact-check's reviewed claim is, how much of the claim an encyclopedia
+    sentence or a news headline states."""
+    if item["kind"] == "fact_check":
+        strength = item.get("claim_match", item.get("relevance", 0.0))
+    elif item["kind"] == "reference":
+        strength = item.get("relevance", 0.0)
+    else:
+        strength = item.get("headline_match", item.get("relevance", 0.0))
+    return round(max(0.0, min(1.0, strength)), 2)
+
+
 def fallback_stances(items):
     """fallback_stance for every item. Published fact-checks outrank keyword matching:
     once one refutes the claim, news stories no longer count as support."""
@@ -546,7 +559,7 @@ def fallback_stances(items):
 
 
 def summarize(items, stances):
-    """A plain one-line reason when Claude is unavailable."""
+    """A plain one-line reason when the LLM is unavailable."""
     refutes = sum(1 for s in stances if s == "REFUTES")
     supports = sum(1 for s in stances if s == "SUPPORTS")
     mixed = sum(1 for s in stances if s == "MIXED")

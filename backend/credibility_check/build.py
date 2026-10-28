@@ -2,10 +2,10 @@
 
     python backend/credibility_check/build.py
 
-The Check API uses only the standard library and boto3, which the AWS Lambda
-Python runtime provides. The worker also bundles the packages in
-check_worker/requirements.txt (the Anthropic SDK), downloaded from PyPI as
-Linux builds for the Python 3.13 x86_64 runtime.
+Both use only the standard library and boto3, which the AWS Lambda Python
+runtime provides. A requirements.txt next to a function's code, if one is
+added, is installed into its package as Linux builds for the Python 3.13
+x86_64 runtime.
 """
 
 import shutil

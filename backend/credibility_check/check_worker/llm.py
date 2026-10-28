@@ -1,66 +1,80 @@
-"""Claude on Amazon Bedrock for the two judgement steps of a check:
+"""The LLM steps of a check, on NVIDIA's hosted model API (build.nvidia.com):
 
     extract_claim  step 2: the checkable claim in the OCR text, or why there is none
-    judge_sources  step 4: whether each fact-check supports or refutes the claim
+    judge_sources  step 4: each source's stance toward the claim, and how directly
+                   it settles it
 
-Both use structured outputs, so the reply is JSON that matches the schema, and
-temperature 0 (sent through extra_body, since SDK 1.x dropped the argument), so
-the same screenshot gets the same answer (consistency NFR).
-The model is set by MODEL_ID (default Claude Haiku 4.5) and authenticated with
-the Lambda role's AWS credentials; there is no API key.
+The model is set by MODEL_ID (default NVIDIA Nemotron 3 Ultra) and called through
+the OpenAI-compatible chat completions endpoint with thinking switched off and
+temperature 0, so the same screenshot gets the same answer (consistency NFR).
+Each reply must be one JSON object of the documented shape and is checked
+before use. The API key comes from SSM through set_api_key().
 """
 
 import json
 import os
+import re
+import urllib.error
+import urllib.request
 
-try:
-    import anthropic
+API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+DEFAULT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
+TIMEOUT_SECONDS = 50
+STANCES = ("SUPPORTS", "REFUTES", "MIXED", "UNRELATED")
 
-    _API_ERRORS = (anthropic.APIConnectionError, anthropic.APIStatusError)
-except ImportError:  # unit tests run without the SDK and inject a fake client
-    anthropic = None
-    _API_ERRORS = ()
-
-DEFAULT_MODEL = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-STANCES = ("SUPPORTS", "REFUTES", "UNRELATED")
-
-_client = None
+_api_key = None
 
 
 class LLMError(Exception):
-    """Claude could not produce a usable answer."""
+    """The model could not produce a usable answer."""
 
 
-def _claude():
-    global _client
-    if _client is None:
-        if anthropic is None:
-            raise LLMError("The anthropic SDK is not installed")
-        _client = anthropic.AnthropicBedrock(aws_region=os.environ.get("AWS_REGION", "us-east-1"))
-    return _client
+def set_api_key(key):
+    global _api_key
+    _api_key = key or None
 
 
-def _ask(system, user, schema, max_tokens):
+def _post(body):
+    """Sends one chat completion request and returns the decoded reply."""
+    request = urllib.request.Request(API_URL, data=json.dumps(body).encode("utf-8"), headers={
+        "Authorization": f"Bearer {_api_key}", "Content-Type": "application/json", "Accept": "application/json"})
     try:
-        response = _claude().messages.create(
-            model=os.environ.get("MODEL_ID", DEFAULT_MODEL),
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-            output_config={"format": {"type": "json_schema", "schema": schema}},
-            # SDK 1.x has no temperature argument; Haiku 4.5 still honours it, and
-            # temperature 0 keeps verdicts repeatable (consistency NFR).
-            extra_body={"temperature": 0},
-        )
-    except _API_ERRORS as e:
-        raise LLMError(f"Claude request failed: {type(e).__name__}") from e
-    if response.stop_reason != "end_turn":
-        raise LLMError(f"Claude stopped with {response.stop_reason}")
-    text = next((b.text for b in response.content if b.type == "text"), None)
+        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise LLMError(f"NVIDIA API returned HTTP {e.code}") from None
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise LLMError(f"NVIDIA API request failed: {type(e).__name__}") from None
+
+
+def _ask(system, user, max_tokens):
+    if not _api_key:
+        raise LLMError("No NVIDIA API key is configured")
+    reply = _post({
+        "model": os.environ.get("MODEL_ID", DEFAULT_MODEL),
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        # Nemotron 3 thinks before answering unless told not to; these short
+        # judgements don't need it, and it would cost time and tokens.
+        "chat_template_kwargs": {"enable_thinking": False},
+    })
+    choice = (reply.get("choices") or [{}])[0]
+    if choice.get("finish_reason") not in ("stop", None):
+        raise LLMError(f"The model stopped with {choice.get('finish_reason')}")
+    return _parse_json((choice.get("message") or {}).get("content") or "")
+
+
+def _parse_json(text):
+    """The JSON object in a reply, ignoring any thinking or code fences around it."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end < start:
+        raise LLMError("The model did not return JSON")
     try:
-        return json.loads(text)
-    except (TypeError, json.JSONDecodeError) as e:
-        raise LLMError("Claude did not return valid JSON") from e
+        return json.loads(text[start:end + 1])
+    except json.JSONDecodeError as e:
+        raise LLMError("The model did not return valid JSON") from e
 
 
 CLAIM_SYSTEM = """You read text taken from a screenshot of a social-media post. The text comes from OCR, so it can \
@@ -75,27 +89,22 @@ Find the single main factual claim that a fact-checker could verify, and classif
 For a claim, rewrite it as one clear, self-contained English sentence: keep names, places and numbers exactly, \
 resolve words like "this" or "he" from the surrounding text, and add nothing that the post does not say. Also give \
 a short search_query of 3 to 8 keywords from the claim, as a fact-check search engine would match it. For anything \
-other than a claim, return an empty claim and an empty search_query."""
+other than a claim, return an empty claim and an empty search_query.
 
-CLAIM_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "kind": {"type": "string", "enum": ["claim", "opinion", "satire", "no_claim"]},
-        "claim": {"type": "string"},
-        "search_query": {"type": "string"},
-    },
-    "required": ["kind", "claim", "search_query"],
-    "additionalProperties": False,
-}
+Reply with only this JSON object and nothing else:
+{"kind": "claim" | "opinion" | "satire" | "no_claim", "claim": "...", "search_query": "..."}"""
 
 
 def extract_claim(lines):
     """Returns {"kind", "claim", "search_query"}."""
     text = "\n".join(lines)
-    result = _ask(CLAIM_SYSTEM, f"<ocr_text>\n{text}\n</ocr_text>", CLAIM_SCHEMA, max_tokens=512)
-    if result.get("kind") == "claim" and not result.get("claim", "").strip():
-        raise LLMError("Claude classified the text as a claim but returned no claim")
-    return result
+    result = _ask(CLAIM_SYSTEM, f"<ocr_text>\n{text}\n</ocr_text>", max_tokens=512)
+    kind = result.get("kind")
+    if kind not in ("claim", "opinion", "satire", "no_claim"):
+        raise LLMError("The model returned an unknown kind of post")
+    if kind == "claim" and not str(result.get("claim", "")).strip():
+        raise LLMError("The model classified the text as a claim but returned no claim")
+    return {"kind": kind, "claim": str(result.get("claim", "")), "search_query": str(result.get("search_query", ""))}
 
 
 JUDGE_SYSTEM = """You compare a claim with sources found for it. There are three kinds of source:
@@ -105,40 +114,29 @@ JUDGE_SYSTEM = """You compare a claim with sources found for it. There are three
 Judge only from these fields, not from your own knowledge.
 
 For each numbered source, decide its stance toward the claim:
-- SUPPORTS: a fact-check of the same claim that rates it true, mostly true, or correct; or a news article that \
+- SUPPORTS: a fact-check of the same claim that rates it true, mostly true, or correct; a news article that \
 reports the claim as established fact; or an encyclopedia article whose text states the claim as a current fact.
-- REFUTES: a fact-check of the same claim that rates it false, mostly false, fabricated, or misleading; or a news \
-article that reports the claim as false or debunked.
-- UNRELATED: a source about a different claim, a mixed or unclear rating (for example half true, unproven, or \
-missing context), or a news article that only mentions the topic without confirming or denying the claim.
+- REFUTES: a fact-check of the same claim that rates it false, mostly false, fabricated, or misleading; a news \
+article that reports the claim as false or debunked; or an encyclopedia article whose text plainly contradicts it.
+- MIXED: a fact-check of the same claim with an in-between rating, such as half true or missing context.
+- UNRELATED: a source about a different claim, or one that only mentions the topic without confirming or denying \
+the claim.
+
+Also give each source a strength from 0.0 to 1.0: how directly and clearly it settles this exact claim. 1.0 is a \
+fact-check of exactly this claim, or a source that states exactly this as fact; 0.5 is a source that addresses the \
+claim only partly or indirectly; 0.2 is a source that barely touches it. Use 0.0 for UNRELATED.
 
 Then write one short, plain sentence for a general audience that summarizes what the sources found, such as \
-"Two fact-checkers rated this claim false." Do not give a final verdict or a score."""
+"Two fact-checkers rated this claim false." Do not give a final verdict or a score.
 
-JUDGE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "stances": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "index": {"type": "integer"},
-                    "stance": {"type": "string", "enum": list(STANCES)},
-                },
-                "required": ["index", "stance"],
-                "additionalProperties": False,
-            },
-        },
-        "reason": {"type": "string"},
-    },
-    "required": ["stances", "reason"],
-    "additionalProperties": False,
-}
+Reply with only this JSON object and nothing else:
+{"sources": [{"index": 1, "stance": "SUPPORTS" | "REFUTES" | "MIXED" | "UNRELATED", "strength": 0.0}], \
+"reason": "..."}"""
 
 
 def judge_sources(claim, sources):
-    """Returns ([stance for each source, in order], reason). Missing indexes count as UNRELATED."""
+    """Returns ([stance for each source], [strength for each source], reason), in source order.
+    Sources the model left out count as UNRELATED with strength 0."""
     def describe(i, s):
         if s.get("kind", "fact_check") == "fact_check":
             # Fact-check articles found in news feeds have a headline and summary but no rating.
@@ -154,10 +152,14 @@ def judge_sources(claim, sources):
 
     listing = "\n\n".join(describe(i, s) for i, s in enumerate(sources, start=1))
     user = f"<claim>\n{claim}\n</claim>\n\n<sources>\n{listing}\n</sources>"
-    result = _ask(JUDGE_SYSTEM, user, JUDGE_SCHEMA, max_tokens=1024)
+    result = _ask(JUDGE_SYSTEM, user, max_tokens=1500)
     by_index = {}
-    for item in result.get("stances", []):
-        if item.get("stance") in STANCES and isinstance(item.get("index"), int):
-            by_index[item["index"]] = item["stance"]
-    stances = [by_index.get(i, "UNRELATED") for i in range(1, len(sources) + 1)]
-    return stances, result.get("reason", "").strip()
+    for item in result.get("sources", []):
+        if isinstance(item, dict) and item.get("stance") in STANCES and isinstance(item.get("index"), int):
+            try:
+                strength = max(0.0, min(1.0, float(item.get("strength", 0.0))))
+            except (TypeError, ValueError):
+                strength = 0.0
+            by_index[item["index"]] = (item["stance"], strength)
+    judged = [by_index.get(i, ("UNRELATED", 0.0)) for i in range(1, len(sources) + 1)]
+    return [s for s, _ in judged], [m for _, m in judged], str(result.get("reason", "")).strip()

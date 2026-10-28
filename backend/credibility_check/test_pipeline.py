@@ -1,4 +1,4 @@
-"""Tests for the evidence and Claude steps of the worker, with fakes for Claude, SSM and every search API."""
+"""Tests for the evidence and LLM steps of the worker, with fakes for the LLM API, SSM and every search API."""
 
 import json
 import os
@@ -7,7 +7,6 @@ import sys
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -22,6 +21,7 @@ USER, CHECK = "44b8a418-d021-70bf-86aa-875bc10aeb8c", "1790380000000-abcdef12"
 LINES = ["Jane Doe", "@janedoe . 2h", "BREAKING: Drinking two cups of coffee a day cures the flu, doctors say."]
 CLAIM = "Drinking two cups of coffee a day cures the flu."
 GOOGLE_PARAM, NEWSAPI_PARAM = "/cloudlens/google-factcheck-api-key", "/cloudlens/newsapi-key"
+NVIDIA_PARAM = "/cloudlens/nvidia-api-key"
 
 
 def review(site, rating, url=None, claimed=CLAIM, title="Does coffee cure the flu?"):
@@ -34,32 +34,31 @@ def seed_sources():
     return evidence.TrustedSources(evidence.load_seed())
 
 
-class FakeClaude:
-    """Answers the claim and judge calls with canned JSON, like the structured-outputs API."""
+class FakeLLM:
+    """Stands in for llm._post: answers the claim and judge calls with canned JSON,
+    shaped like an OpenAI-compatible chat completion."""
 
-    def __init__(self, claim=None, stances=None, reason="Two fact-checkers rated this claim false.",
-                 claim_stop="end_turn", judge_stop="end_turn"):
+    def __init__(self, claim=None, stances=None, strength=0.9, reason="Two fact-checkers rated this claim false.",
+                 claim_finish="stop", judge_finish="stop", wrap=lambda text: text):
         self.claim = claim or {"kind": "claim", "claim": CLAIM, "search_query": "coffee cures flu"}
-        self.stances, self.reason = stances, reason
-        self.claim_stop, self.judge_stop = claim_stop, judge_stop
+        self.stances, self.strength, self.reason = stances, strength, reason
+        self.claim_finish, self.judge_finish, self.wrap = claim_finish, judge_finish, wrap
         self.calls = []
-        self.messages = self
 
-    def create(self, **kwargs):
-        self.calls.append(kwargs)
-        assert "temperature" not in kwargs  # removed from SDK 1.x signatures
-        assert kwargs["extra_body"] == {"temperature": 0}
-        assert kwargs["output_config"]["format"]["type"] == "json_schema"
-        if kwargs["system"] == llm.CLAIM_SYSTEM:
-            return self._reply(self.claim, self.claim_stop)
-        n = len(re.findall(r"^\[\d+\] ", kwargs["messages"][0]["content"], re.M))
+    def __call__(self, body):
+        self.calls.append(body)
+        assert body["temperature"] == 0 and body["chat_template_kwargs"] == {"enable_thinking": False}
+        system, user = body["messages"][0]["content"], body["messages"][1]["content"]
+        if system == llm.CLAIM_SYSTEM:
+            return self._reply(self.claim, self.claim_finish)
+        n = len(re.findall(r"^\[\d+\] ", user, re.M))
         stances = self.stances or ["REFUTES"] * n
-        return self._reply({"stances": [{"index": i + 1, "stance": s} for i, s in enumerate(stances)],
-                            "reason": self.reason}, self.judge_stop)
+        return self._reply({"sources": [{"index": i + 1, "stance": s, "strength": self.strength}
+                                        for i, s in enumerate(stances)],
+                            "reason": self.reason}, self.judge_finish)
 
-    @staticmethod
-    def _reply(payload, stop):
-        return SimpleNamespace(stop_reason=stop, content=[SimpleNamespace(type="text", text=json.dumps(payload))])
+    def _reply(self, payload, finish):
+        return {"choices": [{"message": {"content": self.wrap(json.dumps(payload))}, "finish_reason": finish}]}
 
 
 class FakeSSM:
@@ -341,23 +340,42 @@ class EvidenceTest(unittest.TestCase):
 
 
 class JudgeTest(unittest.TestCase):
+    def setUp(self):
+        self._post = llm._post
+        llm.set_api_key("NVKEY")
+
+    def tearDown(self):
+        llm._post = self._post
+        llm.set_api_key(None)
+
     def test_missing_indexes_count_as_unrelated_and_news_is_described(self):
-        claude = FakeClaude(stances=["REFUTES"])
-        llm._client = claude
+        fake = llm._post = FakeLLM(stances=["REFUTES"], strength=0.8)
         sources = [{"kind": "fact_check", "publisher": "Snopes", "domain": "snopes.com", "claim_reviewed": CLAIM,
                     "title": "t", "rating": "False"},
                    {"kind": "news", "publisher": "Reuters", "domain": "reuters.com", "title": "Coffee and flu",
                     "summary": "Doctors disagree."}]
-        stances, reason = llm.judge_sources(CLAIM, sources)
-        self.assertEqual(stances, ["REFUTES", "UNRELATED"])
-        prompt = claude.calls[0]["messages"][0]["content"]
+        stances, strengths, reason = llm.judge_sources(CLAIM, sources)
+        self.assertEqual((stances, strengths), (["REFUTES", "UNRELATED"], [0.8, 0.0]))
+        prompt = fake.calls[0]["messages"][1]["content"]
         self.assertIn("News article from Reuters", prompt)
         self.assertIn("Summary: Doctors disagree.", prompt)
+        self.assertEqual(fake.calls[0]["model"], llm.DEFAULT_MODEL)
 
-    def test_non_end_turn_stop_is_an_error(self):
-        llm._client = FakeClaude(claim_stop="refusal")
+    def test_cut_off_reply_is_an_error(self):
+        llm._post = FakeLLM(claim_finish="length")
         with self.assertRaises(llm.LLMError):
             llm.extract_claim(LINES)
+
+    def test_json_is_found_inside_thinking_and_code_fences(self):
+        llm._post = FakeLLM(wrap=lambda text: f"<think>Let me see.</think>```json\n{text}\n```")
+        self.assertEqual(llm.extract_claim(LINES)["claim"], CLAIM)
+
+    def test_no_key_means_no_call(self):
+        llm.set_api_key(None)
+        fake = llm._post = FakeLLM()
+        with self.assertRaises(llm.LLMError):
+            llm.extract_claim(LINES)
+        self.assertEqual(fake.calls, [])
 
 
 class PipelineTest(unittest.TestCase):
@@ -365,6 +383,7 @@ class PipelineTest(unittest.TestCase):
         os.environ.update(CHECKS_TABLE="checks", CACHE_TABLE="cache", SOURCES_TABLE="sources", BUCKET_NAME="bucket",
                           EVIDENCE_ENABLED="true", GDELT_ENABLED="true", MAX_RESULTS="5",
                           FACTCHECK_KEY_PARAM=GOOGLE_PARAM, NEWSAPI_KEY_PARAM=NEWSAPI_PARAM,
+                          NVIDIA_KEY_PARAM=NVIDIA_PARAM,
                           GUARDIAN_KEY_PARAM="/cloudlens/guardian-api-key")
         self.checks = FakeTable(["userId", "checkId"])
         self.cache = FakeTable(["imageHash"])
@@ -375,7 +394,8 @@ class PipelineTest(unittest.TestCase):
                               "status": "QUEUED"})
         worker._tables = {"checks": self.checks, "cache": self.cache, "sources": self.sources}
         worker._textract = FakeTextract(LINES)
-        worker._ssm, worker._keys, worker._sources = FakeSSM({GOOGLE_PARAM: "GKEY"}), {}, None
+        worker._ssm, worker._keys, worker._sources = FakeSSM({GOOGLE_PARAM: "GKEY", NVIDIA_PARAM: "NVKEY"}), {}, None
+        self._post = llm._post
         self.web = FakeWeb()
         self.web.responses = {"factchecktools": {"claims": [
             review("snopes.com", "False"), review("politifact.com", "Pants on Fire"), review("randomblog.net", "False")]}}
@@ -384,50 +404,55 @@ class PipelineTest(unittest.TestCase):
 
     def tearDown(self):
         evidence._http_get_json, evidence._http_get_xml = self._original
+        llm._post = self._post
+        llm.set_api_key(None)
 
-    def run_check(self, claude):
-        llm._client = claude
+    def run_check(self, fake_llm):
+        llm._post = fake_llm
         worker.lambda_handler({"userId": USER, "checkId": CHECK}, None)
         return self.checks.items[(USER, CHECK)]
 
     def test_two_refuting_fact_checkers_give_false(self):
-        claude = FakeClaude()
-        item = self.run_check(claude)
-        self.assertEqual((item["status"], item["verdict"], item["score"]), ("DONE", "FALSE", 0))
+        fake = FakeLLM()
+        item = self.run_check(fake)
+        self.assertEqual((item["status"], item["verdict"], item["score"]), ("DONE", "FALSE", 8))
+        # What went into the score is kept with the result.
+        self.assertEqual((item["judgedBy"], item["certainty"]), (llm.DEFAULT_MODEL, 83))
+        self.assertEqual([(x["weight"], x["strength"]) for x in item["sources"]], [(100, 90), (100, 90)])
         self.assertEqual(item["claim"], CLAIM)
         self.assertEqual(item["reason"], "Two fact-checkers rated this claim false.")
         self.assertEqual([s["domain"] for s in item["sources"]], ["snopes.com", "politifact.com"])
-        self.assertNotIn("randomblog", claude.calls[1]["messages"][0]["content"])  # untrusted never sent
+        self.assertNotIn("randomblog", fake.calls[1]["messages"][1]["content"])  # untrusted never sent
         self.assertEqual(item["providers"]["google_news"], "failed")  # unavailable, but not needed
         self.assertIn(("h",), self.cache.items)  # the main source worked, so the result is cached
 
     def test_two_supporting_wire_services_give_true(self):
         self.web.responses = {"factchecktools": {"claims": [review("apnews.com", "True"),
                                                             review("reuters.com", "Correct")]}}
-        item = self.run_check(FakeClaude(stances=["SUPPORTS", "SUPPORTS"], reason="Two sources confirm it."))
-        self.assertEqual((item["verdict"], item["score"]), ("TRUE", 100))
+        item = self.run_check(FakeLLM(stances=["SUPPORTS", "SUPPORTS"], reason="Two sources confirm it."))
+        self.assertEqual((item["verdict"], item["score"]), ("TRUE", 92))
 
     def test_one_fact_check_of_the_same_claim_is_enough(self):
         self.web.responses = {"factchecktools": {"claims": [review("snopes.com", "False")]}}
-        item = self.run_check(FakeClaude())
-        self.assertEqual((item["verdict"], item["score"]), ("FALSE", 0))
+        item = self.run_check(FakeLLM())
+        self.assertEqual((item["verdict"], item["score"]), ("FALSE", 20))
 
     def test_one_loosely_matching_fact_check_is_not_enough(self):
         self.web.responses = {"factchecktools": {"claims": [
             review("snopes.com", "False", claimed="Coffee shortages hit cafes", title="Coffee shortage claims")]}}
-        item = self.run_check(FakeClaude())
+        item = self.run_check(FakeLLM())
         # It reviewed a different claim, so it is left out instead of deciding anything.
         self.assertEqual((item["verdict"], item["score"], item["sources"]), ("UNVERIFIED", 50, []))
 
-    def test_without_claude_ratings_still_give_a_verdict(self):
-        item = self.run_check(FakeClaude(claim_stop="max_tokens", judge_stop="max_tokens"))
-        self.assertEqual((item["verdict"], item["score"]), ("FALSE", 0))
+    def test_without_the_llm_ratings_still_give_a_verdict(self):
+        item = self.run_check(FakeLLM(claim_finish="length", judge_finish="length"))
+        self.assertEqual((item["verdict"], item["score"]), ("FALSE", 7))
         self.assertIn("coffee", item["claim"])  # found by the rules
         self.assertEqual(item["reason"], "2 trusted fact-checks rated this claim false or misleading.")
         self.assertEqual(self.cache.items, {})  # fallbacks are never cached
 
     def test_opinions_are_not_searched(self):
-        item = self.run_check(FakeClaude(claim={"kind": "opinion", "claim": "", "search_query": ""}))
+        item = self.run_check(FakeLLM(claim={"kind": "opinion", "claim": "", "search_query": ""}))
         self.assertIn("opinion", item["reason"])
         self.assertIsNone(item["score"])  # nothing to score
         self.assertEqual(self.web.calls, [])
@@ -435,46 +460,46 @@ class PipelineTest(unittest.TestCase):
 
     def test_missing_google_key_with_no_other_sources(self):
         worker._ssm = FakeSSM({})
-        item = self.run_check(FakeClaude())
+        item = self.run_check(FakeLLM())
         self.assertIn("not configured", item["reason"])
         self.assertEqual(self.cache.items, {})
 
     def test_news_provider_works_without_the_google_key(self):
-        worker._ssm = FakeSSM({NEWSAPI_PARAM: "NKEY"})
+        worker._ssm = FakeSSM({NEWSAPI_PARAM: "NKEY", NVIDIA_PARAM: "NVKEY"})
         self.web.responses = {"newsapi.org": {"status": "ok", "articles": [
             {"source": {"name": "AP"}, "url": "https://apnews.com/a", "title": "No, coffee does not cure flu",
              "description": "Health experts say the viral claim is false."},
             {"source": {"name": "Reuters"}, "url": "https://www.reuters.com/b", "title": "Fact check: coffee flu",
              "description": "The claim is false."}]}}
-        item = self.run_check(FakeClaude())
+        item = self.run_check(FakeLLM())
         self.assertEqual([s["kind"] for s in item["sources"]], ["news", "news"])
         self.assertEqual(item["verdict"], "FALSE")
         self.assertEqual(self.cache.items, {})  # the main source was missing
 
     def test_google_failure_with_no_other_sources(self):
         self.web.responses = {"factchecktools": evidence.EvidenceError("HTTP 500")}
-        item = self.run_check(FakeClaude())
+        item = self.run_check(FakeLLM())
         self.assertIn("could not be completed", item["reason"])
         self.assertEqual(self.cache.items, {})
 
     def test_disabled_source_in_the_table_is_ignored(self):
         self.sources.items[("snopes.com",)]["enabled"] = False
-        item = self.run_check(FakeClaude())
+        item = self.run_check(FakeLLM())
         self.assertEqual([s["domain"] for s in item["sources"]], ["politifact.com"])
 
     def test_source_added_to_the_table_is_trusted(self):
         self.sources.put_item({"domain": "randomblog.net", "name": "Random Blog", "category": "fact_checker",
                                "weight": 1.0, "enabled": True})
-        item = self.run_check(FakeClaude())
+        item = self.run_check(FakeLLM())
         self.assertIn("randomblog.net", [s["domain"] for s in item["sources"]])
 
     def test_no_evidence_gives_a_neutral_score(self):
         self.web.responses = {"factchecktools": {}}
-        item = self.run_check(FakeClaude())
+        item = self.run_check(FakeLLM())
         self.assertEqual((item["verdict"], item["score"], item["sources"]), ("UNVERIFIED", 50, []))
         self.assertIn("were found yet", item["reason"])
 
-    def test_without_claude_matching_news_counts_and_off_topic_is_hidden(self):
+    def test_without_the_llm_matching_news_counts_and_off_topic_is_hidden(self):
         worker._ssm = FakeSSM({GOOGLE_PARAM: "GKEY", NEWSAPI_PARAM: "NKEY"})
         self.web.responses = {"factchecktools": {}, "newsapi.org": {"status": "ok", "articles": [
             {"source": {"name": "AP"}, "url": "https://apnews.com/a",
@@ -482,13 +507,13 @@ class PipelineTest(unittest.TestCase):
             {"source": {"name": "Reuters"}, "url": "https://www.reuters.com/b",
              "title": "Drinking two cups of coffee cures flu, doctors report", "description": "A new study."},
             {"source": {"name": "BBC"}, "url": "https://www.bbc.com/c", "title": "Flu season starts early"}]}}
-        item = self.run_check(FakeClaude(claim_stop="max_tokens", judge_stop="max_tokens"))
+        item = self.run_check(FakeLLM(claim_finish="length", judge_finish="length"))
         self.assertEqual([s["stance"] for s in item["sources"]], ["SUPPORTS", "SUPPORTS"])
-        self.assertEqual((item["verdict"], item["score"]), ("TRUE", 100))
+        self.assertEqual((item["verdict"], item["score"]), ("TRUE", 91))
         self.assertEqual(item["reason"], "2 trusted sources back up this claim.")
 
     def test_stages_still_run_in_order(self):
-        self.run_check(FakeClaude())
+        self.run_check(FakeLLM())
         stages = [h["status"] for h in self.checks.history]
         self.assertEqual(stages, ["READING_TEXT", "FINDING_CLAIM", "SEARCHING_SOURCES", "SCORING", "DONE"])
 

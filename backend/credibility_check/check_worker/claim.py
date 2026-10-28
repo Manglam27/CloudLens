@@ -100,7 +100,7 @@ _ATTRIBUTION = re.compile(
 
 
 def search_query(claim):
-    """Keywords for the fact-check search, used when Claude can't write the query.
+    """Keywords for the fact-check search, used when the LLM can't write the query.
 
     Fact-check search matches a few keywords far better than a whole sentence,
     so this drops "BREAKING:", "doctors say" and common words.

@@ -55,34 +55,39 @@ with no social-media integration.
    on a local one. The server saves a job and returns at once; the app polls every
    2 seconds and shows the current step.
 2. **Read text:** Amazon Textract extracts the text lines from the screenshot.
-3. **Find the claim:** Claude Haiku 4.5 on Amazon Bedrock keeps the checkable
+3. **Find the claim:** an LLM, NVIDIA Nemotron 3 Ultra, keeps the checkable
    statement, or returns none for opinions and jokes. Rules that remove names,
    @handles, times and like counts are the fallback.
 4. **Find evidence:** Google Fact Check Tools, Google News, Bing News,
    Wikipedia, NewsAPI and The Guardian are searched in parallel. Only sites in
    the trusted-source table (fact-checkers, wire services, news outlets and
    Wikipedia, 109 in all) count, at most 8 results.
-5. **Judge the sources:** Claude labels each source Supports, Refutes or
-   Unrelated and writes a short reason. Rules that read fact-check ratings and
-   headlines are the fallback.
+5. **Judge the sources:** the LLM labels each source Supports, Refutes, Mixed or
+   Unrelated, rates how directly it settles the claim (its strength, 0 to 1) and
+   writes a short reason. Rules that read fact-check ratings, headlines and
+   keyword matches are the fallback.
 6. **Score:** the formula below gives the score and verdict, which are saved for
    history.
 
 ### Credibility score
 
-- Each source has a weight: **1.0** for fact-checkers and wire services, **0.6**
-  for established news outlets and Wikipedia. Unknown sites are ignored.
-- **Balance = 100 × supporting weight ÷ (supporting + refuting weight)**. A mixed
-  rating ("Half True") counts half each way; with no evidence the balance is 50.
-- **True:** balance ≥ 70, and at least 2 independent trusted sources support the
-  claim, or one published fact-check or Wikipedia sentence states it.
-- **False:** balance ≤ 30, and at least 2 independent trusted sources refute it,
-  or one published fact-check of this same claim does.
-- **Unverified:** every other case, including too few sources, disagreement,
-  opinions, or no evidence.
-- **Score shown:** the balance for True and False, so True is always 70–100 and
-  False 0–30. An Unverified claim is shown between 35 and 65: above 50 the
-  evidence leans true, below 50 it leans false.
+- Each source has a **weight**, how much the site is trusted: **1.0** for
+  fact-checkers and wire services, **0.6** for established news outlets and
+  Wikipedia. Unknown sites are ignored.
+- Each source that takes a side also has a **strength**, how directly it
+  settles this exact claim, from 0 to 1.
+- **Vote** = weight × strength; a site counts once. **S** adds up the votes for
+  the claim and **R** the votes against (a "Half True" rating gives half to each).
+- **Direction** D = (S − R) ÷ (S + R) and **certainty** C = 1 − e^(−(S + R)).
+- **Score = 50 + 50 × D × C.** 50 means no evidence or an even split; more and
+  stronger evidence on one side moves the score further from 50. One strong
+  fact-check rating a claim false gives about 20, two give 8, three give 3.
+- **True:** score ≥ 70; **False:** score ≤ 30; **Unverified:** in between. True
+  or False also needs 2 independent trusted sources on that side, or one
+  published fact-check (or, for True, a Wikipedia sentence) of this claim;
+  otherwise the score is held at 69 or 31.
+
+The backend README has the full rules and worked examples.
 
 The limits 70 and 30 are kept in configuration, so they can be tuned without
 redeploying.
@@ -103,8 +108,8 @@ Flutter app ── login ───────────► Amazon Cognito (ac
                                                               ▼
                                                         Check worker Lambda
                                                           ├─ Amazon Textract (OCR)
-                                                          ├─ Amazon Bedrock, Claude Haiku 4.5
-                                                          └─ fact-check and news searches
+                                                          ├─ NVIDIA Nemotron 3 Ultra (LLM)
+                                                          └─ fact-check, news and Wikipedia searches
 ```
 
 Only the extracted claim text is sent to the outside search services; photos
@@ -136,16 +141,15 @@ never leave AWS.
   Lambda.
 - Credibility check: Check button, live progress, result screen with sources,
   History tab, Textract OCR, evidence search over five providers, a trusted-source
-  table, Claude claim and stance steps with rule fallbacks, and the scoring formula.
+  table, LLM claim and stance steps (NVIDIA Nemotron) with rule fallbacks, and a
+  score that grows with the amount and strength of the evidence.
 
 **Next**
-1. Enable Anthropic model access on Amazon Bedrock for the account, so checks use
-   Claude instead of the rule fallbacks.
-2. Measure the OCR and verdict accuracy targets on a test set of 100+ screenshots.
-3. Private per-user folders (`private/<identity id>/`) enforced by IAM, so S3
+1. Measure the OCR and verdict accuracy targets on a test set of 100+ screenshots.
+2. Private per-user folders (`private/<identity id>/`) enforced by IAM, so S3
    itself blocks access to other users' photos.
-4. Require sign-in on `/photoEdits`, like the `/checks` routes.
-5. Store favorites as photo keys instead of links that expire.
+3. Require sign-in on `/photoEdits`, like the `/checks` routes.
+4. Store favorites as photo keys instead of links that expire.
 
 ## Toolchain
 
@@ -180,8 +184,8 @@ never leave AWS.
 
 4. Backend: each Lambda has its own README with test, build and deploy steps,
    in `backend/photo_edits/` and `backend/credibility_check/`. The credibility
-   check also needs a Google Fact Check Tools API key in SSM Parameter Store and
-   Anthropic model access on Amazon Bedrock; see its README.
+   check also needs an NVIDIA API key and a Google Fact Check Tools API key in
+   SSM Parameter Store; see its README.
 
 ## Project structure
 
