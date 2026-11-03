@@ -160,7 +160,7 @@ never leave AWS.
 | Android minSdk / compileSdk | 24 / `flutter.compileSdkVersion` |
 | Android Gradle Plugin | 8.13.0 |
 | Kotlin Gradle Plugin | 2.2.20 |
-| iOS deployment target | 13.0 (required by `amplify_auth_cognito`) |
+| iOS deployment target | 15.0 (Flutter's current minimum; Amplify needs at least 13.0) |
 | Backend | Python 3.13 on AWS Lambda |
 
 ## Setup
@@ -181,6 +181,19 @@ never leave AWS.
    ```
    flutter run
    ```
+
+   **On an iPhone** (needs a Mac with Xcode, CocoaPods and Flutter installed):
+
+   ```
+   cd ios && pod install && cd ..
+   open ios/Runner.xcworkspace
+   ```
+
+   In Xcode, under Runner → Signing & Capabilities, sign in with an Apple ID and
+   pick it as the Team; change the bundle identifier if Xcode says it is taken.
+   Then install with `flutter run --release`, and on the phone trust the
+   developer under Settings → General → VPN & Device Management. With a free
+   Apple ID the app has to be reinstalled every 7 days.
 
 4. Backend: each Lambda has its own README with test, build and deploy steps,
    in `backend/photo_edits/` and `backend/credibility_check/`. The credibility

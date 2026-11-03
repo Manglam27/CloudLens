@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>We need access to your photo library</string>
+	<string>CloudLens shows your photos in the Local tab so you can upload, edit or check them</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>CloudLens saves your photos and edits to your photo library</string>
     <key>NSCameraUsageDescription</key>
-	<string>We need access to your camera</string>
+	<string>CloudLens uses the camera to take photos</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>We need access to your microphone</string>
+	<string>CloudLens does not record audio; the camera may still ask for the microphone</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>

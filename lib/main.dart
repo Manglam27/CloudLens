@@ -17,7 +17,7 @@ class MyApp extends StatefulWidget {
   const MyApp({super.key});
   
   @override
-  _MyAppState createState() => _MyAppState();
+  State<MyApp> createState() => _MyAppState();
 }
 
   class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
@@ -41,9 +41,9 @@ class MyApp extends StatefulWidget {
       // Sign out the user when the app is detached (closed)
       try {
         await Amplify.Auth.signOut();
-        print('User signed out successfully');
+        debugPrint('User signed out successfully');
       } catch (e) {
-        print('Error signing out: $e');
+        debugPrint('Error signing out: $e');
       }
     }
   }
@@ -63,14 +63,14 @@ class MyApp extends StatefulWidget {
 
   // Sign-out function
   Future<void> _signOut(BuildContext context) async {
+    final navigator = Navigator.of(context);
     try {
       await Amplify.Auth.signOut();
-      Navigator.pushReplacement(
-        context,
+      navigator.pushReplacement(
         MaterialPageRoute(builder: (context) => LoginPage(signOutCallback: _signOut)), // Navigate to Login Page after sign-out
       );
     } catch (e) {
-      print('Error signing out: $e');
+      debugPrint('Error signing out: $e');
     }
   }
 

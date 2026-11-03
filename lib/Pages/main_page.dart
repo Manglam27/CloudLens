@@ -28,7 +28,7 @@ class _MainPageState extends State<MainPage> {
     try {
       cameras = await availableCameras();
     } catch (e) {
-      print("Error initializing cameras: $e");
+      debugPrint("Error initializing cameras: $e");
     }
     if (!mounted) return;
     setState(() => _camerasLoaded = true);
@@ -59,7 +59,7 @@ class _MainPageState extends State<MainPage> {
         _userEmail = emailAttribute.value; // Set the user's email
       });
     } catch (e) {
-      print("Error getting current user: $e");
+      debugPrint("Error getting current user: $e");
     }
   }
 
