@@ -85,9 +85,13 @@ Find the single main factual claim that a fact-checker could verify, and classif
 - opinion: it is a personal view, preference, or prediction.
 - satire: it is an obvious joke or parody.
 - no_claim: there is no statement to check.
+A news headline or press-release title reports that something happened, so it is a claim even when it is worded \
+as a celebration or welcome (for example "NASA welcomes the Artemis II crew back to Earth" claims the crew returned).
 
 For a claim, rewrite it as one clear, self-contained English sentence: keep names, places and numbers exactly, \
-resolve words like "this" or "he" from the surrounding text, and add nothing that the post does not say. Also give \
+resolve words like "this" or "he" from the surrounding text, and add nothing that the post does not say. Keep \
+words about timing such as "just", "today", "now", "breaking" or "new", and any dates, because a real event \
+presented as new is a common false claim. Also give \
 a short search_query of 3 to 8 keywords from the claim, as a fact-check search engine would match it. For anything \
 other than a claim, return an empty claim and an empty search_query.
 
@@ -116,7 +120,8 @@ Judge only from these fields, not from your own knowledge.
 For each numbered source, decide its stance toward the claim:
 - SUPPORTS: a fact-check of the same claim that rates it true, mostly true, or correct; a news article that \
 reports the claim as established fact; or an encyclopedia article whose text states the claim as a current fact.
-- REFUTES: a fact-check of the same claim that rates it false, mostly false, fabricated, or misleading; a news \
+- REFUTES: a fact-check of the same claim that rates it false, mostly false, fabricated, or misleading, or whose \
+title says the claim is not true as stated (for example "did NOT", "fake", or an old event presented as new); a news \
 article that reports the claim as false or debunked; or an encyclopedia article whose text plainly contradicts it.
 - MIXED: a fact-check of the same claim with an in-between rating, such as half true or missing context.
 - UNRELATED: a source about a different claim, or one that only mentions the topic without confirming or denying \

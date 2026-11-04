@@ -19,6 +19,11 @@ Each piece of evidence is {"domain", "weight", "stance", "kind", "strength"}:
 5. Score = 50 + 50 x D x C, rounded: 50 means no evidence or an even split;
    the further from 50, the more and the stronger the evidence on one side.
 
+Fact-checks outrank news: when a trusted fact-check addresses this claim with
+strength 0.6 or more, only fact-checks vote. A fact-checker that reviewed the
+exact claim has already weighed the news coverage, which may be old stories
+about a real event that a post presents as new.
+
 Verdict: TRUE at 70 or more, FALSE at 30 or less, UNVERIFIED in between. A
 TRUE or FALSE verdict also needs 2 independent sites on that side, or one
 source that settles the claim by itself (a fact-check of this claim, or a
@@ -54,6 +59,10 @@ def _votes(trusted):
 def score_evidence(evidence, t_true=70, t_false=30, min_sources=MIN_INDEPENDENT_SOURCES):
     """Returns {"verdict", "score", "direction", "certainty", "for", "against", "supporters", "refuters"}."""
     trusted = [e for e in evidence if e.get("weight", 0) > 0]
+    checks = [e for e in trusted if e.get("kind") == "fact_check" and e["stance"] in ("SUPPORTS", "REFUTES", "MIXED")
+              and e.get("strength", 1.0) >= DECISIVE_STRENGTH]
+    if checks:
+        trusted = [e for e in trusted if e.get("kind") == "fact_check"]
     s, r = _votes(trusted)
     supporters = len({e["domain"] for e in trusted if e["stance"] == "SUPPORTS"})
     refuters = len({e["domain"] for e in trusted if e["stance"] == "REFUTES"})
