@@ -84,12 +84,20 @@ class CheckApiTest(unittest.TestCase):
 
     def test_cached_result_is_returned_without_running_again(self):
         self.cache.put_item({"imageHash": hashlib.sha256(IMAGE).hexdigest(), "verdict": "FALSE", "score": 12,
-                             "reason": "2 sources refute this claim.", "claim": "x", "sources": []})
+                             "reason": "2 sources refute this claim.", "claim": "x", "sources": [],
+                             "resultsVersion": "1"})
         status, body = self.start()
         self.assertEqual(status, 200)
         self.assertEqual((body["status"], body["verdict"], body["score"], body["cached"]), ("DONE", "FALSE", 12, True))
         self.assertEqual(self.lam.calls, [])
         self.assertIn((USER, body["checkId"]), self.checks.items)  # still appears in history
+
+    def test_result_from_an_older_checker_is_run_again(self):
+        self.cache.put_item({"imageHash": hashlib.sha256(IMAGE).hexdigest(), "verdict": "TRUE", "score": 91,
+                             "reason": "old", "claim": "x", "sources": []})
+        status, body = self.start()
+        self.assertEqual((status, body["status"]), (202, "QUEUED"))
+        self.assertEqual(len(self.lam.calls), 1)
 
     def test_worker_invoke_failure_marks_the_check_failed(self):
         api._lambda = FakeLambda(fail=True)

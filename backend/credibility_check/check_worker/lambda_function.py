@@ -232,7 +232,8 @@ def lambda_handler(event, context):
         _update(key, **result, kind=kind, providers=report, ocrText="\n".join(lines)[:MAX_OCR_CHARS],
                 status="DONE", finishedAt=_now())
         if complete:
-            _table("CACHE_TABLE").put_item(Item={"imageHash": item["imageHash"], **result})
+            _table("CACHE_TABLE").put_item(Item={"imageHash": item["imageHash"], **result,
+                                                 "resultsVersion": os.environ.get("RESULTS_VERSION", "1")})
     except Exception:
         traceback.print_exc()
         _update(key, status="FAILED", error="The check could not be completed.", finishedAt=_now())

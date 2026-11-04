@@ -11,6 +11,7 @@ for the Cognito user pool, so the caller's user id is the token's `sub` claim.
 Configuration (Lambda environment variables):
     CHECKS_TABLE      DynamoDB table, PK userId, SK checkId
     CACHE_TABLE       DynamoDB table, PK imageHash
+    RESULTS_VERSION   cached results made by another version of the checker are ignored
     BUCKET_NAME       S3 bucket holding the users' photos
     WORKER_FUNCTION   name of the check worker Lambda, invoked asynchronously
 """
@@ -125,8 +126,9 @@ def _start_check(user_id, event):
             "createdAt": now}
 
     # Consistency NFR: a screenshot that was checked before gets the same result.
+    # Only results made by the current version of the checker are reused.
     cached = _table("CACHE_TABLE").get_item(Key={"imageHash": image_hash}).get("Item")
-    if cached:
+    if cached and cached.get("resultsVersion") == os.environ.get("RESULTS_VERSION", "1"):
         item.update({k: cached[k] for k in RESULT_FIELDS if k in cached})
         item.update(status="DONE", cached=True, finishedAt=now)
         _table("CHECKS_TABLE").put_item(Item=item)
