@@ -25,7 +25,11 @@ strength 0.6 or more, only fact-checks vote. A fact-checker that reviewed the
 exact claim has already weighed the news coverage, which may be old stories
 about a real event that a post presents as new. A fact-check about pictures of
 an event ("viral images of the splashdown are AI-generated") does not do this:
-it votes with the rest but cannot set the news aside.
+it votes with the rest but cannot set the news aside. Neither does a fact-check
+whose own rating or headline does not agree with the AI's reading of it
+("confirmed": False), such as "2024 eclipse was real" read as refuting "a total
+eclipse crossed North America", or a fact-check about something else: one
+misread source must not outweigh every news report.
 
 Verdict: TRUE at 70 or more, FALSE at 30 or less, UNVERIFIED in between. A
 TRUE or FALSE verdict also needs 2 independent sites on that side, or one
@@ -63,7 +67,8 @@ def score_evidence(evidence, t_true=70, t_false=30, min_sources=MIN_INDEPENDENT_
     """Returns {"verdict", "score", "direction", "certainty", "for", "against", "supporters", "refuters"}."""
     trusted = [e for e in evidence if e.get("weight", 0) > 0]
     checks = [e for e in trusted if e.get("kind") == "fact_check" and e["stance"] in ("SUPPORTS", "REFUTES", "MIXED")
-              and e.get("strength", 1.0) >= DECISIVE_STRENGTH and not e.get("about_media")]
+              and e.get("strength", 1.0) >= DECISIVE_STRENGTH and not e.get("about_media")
+              and e.get("confirmed", True)]
     if checks:
         trusted = [e for e in trusted if e.get("kind") == "fact_check"]
     s, r = _votes(trusted)

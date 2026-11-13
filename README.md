@@ -58,17 +58,22 @@ with no social-media integration.
    reading it a second time as dark-on-white text so white meme captions are
    read too.
 3. **Find the claim:** an LLM, NVIDIA Nemotron 3 Ultra, keeps the checkable
-   statement, or returns none for opinions and jokes. Rules that remove names,
-   @handles, times and like counts are the fallback.
+   statement, or returns none for opinions and jokes. All checks share NVIDIA's
+   rate limit through a DynamoDB counter; when Nemotron is busy, Gemma 4 31B
+   and then Nemotron 3.5 Lightning answer instead, and identical requests are
+   answered from a cache. Rules that remove names, @handles, times and like
+   counts are the last resort.
 4. **Find evidence:** Google Fact Check Tools, Google News, Bing News,
    Wikipedia, NewsAPI and The Guardian are searched in parallel. Only sites in
    the trusted-source table (fact-checkers, wire services, news outlets and
    Wikipedia, 109 in all) count, at most 10 results, of which fact-checks fill at
    most half so news reporting the event is always judged too.
-5. **Judge the sources:** the LLM labels each source Supports, Refutes, Mixed or
-   Unrelated, rates how directly it settles the claim (its strength, 0 to 1) and
-   writes a short reason. Rules that read fact-check ratings, headlines and
-   keyword matches are the fallback.
+5. **Judge the sources:** the LLM answers, for each source, whether it shows
+   the claim true, false, partly true or does not address it, rates how
+   directly it settles the claim (its strength, 0 to 1) and writes a short
+   reason. A fact-check older than later news confirming the claim is set aside
+   as outdated. Rules that read fact-check ratings are the last resort, and
+   they never call a claim true.
 6. **Score:** the formula below gives the score and verdict, which are saved for
    history.
 

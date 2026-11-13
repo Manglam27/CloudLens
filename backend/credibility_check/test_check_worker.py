@@ -155,6 +155,15 @@ class ScoringTest(unittest.TestCase):
         vague = {**wiki, "stance": "REFUTES", "strength": 0.5}
         self.assertEqual(score_evidence([vague])["verdict"], "UNVERIFIED")
 
+    def test_a_misread_fact_check_cannot_set_the_news_aside(self):
+        news = [self.ev(d, "SUPPORTS", 0.6, strength=1.0) for d in ("apnews.com", "cbsnews.com", "nytimes.com",
+                                                                     "aljazeera.com", "en.wikipedia.org")]
+        # "2024 eclipse was real" read as refuting the eclipse: its own headline says otherwise
+        misread = {**self.check("usatoday.com", "REFUTES", strength=1.0), "confirmed": False}
+        self.assertEqual(score_evidence([misread] + news)["verdict"], "TRUE")
+        # "Senate did NOT just confirm..." agrees with its reading, so it still outranks old news
+        self.assertEqual(score_evidence([{**misread, "confirmed": True}] + news)["verdict"], "FALSE")
+
     def test_a_fact_check_about_pictures_cannot_set_the_news_aside(self):
         fake_photos = {**self.check("factcrescendo.com", "REFUTES"), "about_media": True}
         news = [self.ev(d, "SUPPORTS", 0.6, strength=0.8) for d in ("cbsnews.com", "nytimes.com", "npr.org", "bbc.com", "cnn.com", "pbs.org")]

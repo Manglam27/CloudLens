@@ -15,6 +15,7 @@ from fact-checking sites, or headlined "Fact check", count as fact-checks.
 """
 
 import concurrent.futures
+import email.utils
 import json
 import random
 import re
@@ -141,12 +142,24 @@ def _run_all(search, queries):
     return results
 
 
-def _item(kind, provider, url, title, sources, publisher="", rating="", summary="", claim_reviewed="", domain=None):
+def _item(kind, provider, url, title, sources, publisher="", rating="", summary="", claim_reviewed="", domain=None,
+          date=""):
     domain = normalize_domain(domain or url)
     return {"kind": kind, "provider": provider, "domain": domain,
             "publisher": sources.name(domain, publisher or domain), "url": url, "title": (title or "").strip(),
             "rating": rating or "", "summary": re.sub(r"<[^>]+>", "", summary or "").strip()[:400],
-            "claim_reviewed": claim_reviewed or "", "weight": sources.weight(domain)}
+            "claim_reviewed": claim_reviewed or "", "weight": sources.weight(domain), "date": _day(date)}
+
+
+def _day(value):
+    """'2022-09-08T17:30:00Z' or 'Thu, 08 Sep 2022 17:30:00 GMT' -> '2022-09-08'; '' if unknown."""
+    value = (value or "").strip()
+    if re.match(r"\d{4}-\d{2}-\d{2}", value):
+        return value[:10]
+    try:
+        return email.utils.parsedate_to_datetime(value).date().isoformat()
+    except (TypeError, ValueError, IndexError):
+        return ""
 
 
 SHORT_QUERY_WORDS = 4
@@ -177,7 +190,8 @@ def google_fact_check(queries, key, sources, limit):
             publisher = review.get("publisher") or {}
             items.append(_item("fact_check", "google_fact_check", review.get("url", ""), review.get("title"),
                                sources, publisher=publisher.get("name"), rating=review.get("textualRating"),
-                               claim_reviewed=claim.get("text"), domain=publisher.get("site") or review.get("url")))
+                               claim_reviewed=claim.get("text"), domain=publisher.get("site") or review.get("url"),
+                               date=review.get("reviewDate") or claim.get("claimDate")))
     return items
 
 
@@ -189,7 +203,8 @@ def newsapi(query, key, sources, limit):
     if data.get("status") != "ok":
         raise EvidenceError(f"NewsAPI error: {data.get('code')}")
     return [_item("news", "newsapi", a.get("url", ""), a.get("title"), sources,
-                  publisher=(a.get("source") or {}).get("name"), summary=a.get("description"))
+                  publisher=(a.get("source") or {}).get("name"), summary=a.get("description"),
+                  date=a.get("publishedAt"))
             for a in data.get("articles", [])]
 
 
@@ -202,7 +217,7 @@ def guardian(query, key, sources, limit):
     if data.get("status") != "ok":
         raise EvidenceError("Guardian API error")
     return [_item("news", "guardian", r.get("webUrl", ""), r.get("webTitle"), sources, publisher="The Guardian",
-                  summary=(r.get("fields") or {}).get("trailText"))
+                  summary=(r.get("fields") or {}).get("trailText"), date=r.get("webPublicationDate"))
             for r in data.get("results", [])]
 
 
@@ -216,12 +231,12 @@ def _feed_queries(queries):
     return list(dict.fromkeys([query, f"{query} fact check", (topic and topic[0]) or short_query(query)]))
 
 
-def _feed_item(provider, url, title, sources, publisher, domain, summary=""):
+def _feed_item(provider, url, title, sources, publisher, domain, summary="", date=""):
     """A news feed entry; articles by fact-checkers or headlined "Fact check" count as fact-checks."""
     domain = normalize_domain(domain or url)
     is_fact_check = sources.category(domain) == "fact_checker" or _FACT_CHECK_HEADLINE.search(title or "")
     return _item("fact_check" if is_fact_check else "news", provider, url, title, sources, publisher=publisher,
-                 summary=summary, domain=domain)
+                 summary=summary, domain=domain, date=date)
 
 
 def google_news(query, key, sources, limit):
@@ -237,7 +252,8 @@ def google_news(query, key, sources, limit):
             # Headlines end with " - Publisher".
             title = entry.findtext("title", "").removesuffix(f" - {publisher}")
             items.append(_feed_item("google_news", entry.findtext("link", ""), title, sources, publisher,
-                                    source.get("url", "") if source is not None else ""))
+                                    source.get("url", "") if source is not None else "",
+                                    date=entry.findtext("pubDate", "")))
     return items
 
 
@@ -258,7 +274,7 @@ def bing_news(query, key, sources, limit):
                 publisher = publisher.removesuffix(" on MSN")
                 domain = sources.domain_named(publisher) or domain
             items.append(_feed_item("bing_news", url, entry.findtext("title", ""), sources, publisher, domain,
-                                    summary=entry.findtext("description", "")))
+                                    summary=entry.findtext("description", ""), date=entry.findtext("pubDate", "")))
     return items
 
 
@@ -362,7 +378,7 @@ def find_evidence(query, keys, sources, limit, enabled=None, also_try=(), topic=
         key = (item["domain"], title) if title else item["url"]
         if key in unique:
             kept = unique[key]
-            for field in ("rating", "summary", "claim_reviewed"):
+            for field in ("rating", "summary", "claim_reviewed", "date"):
                 kept[field] = kept[field] or item[field]
         else:
             unique[key] = item
@@ -423,7 +439,7 @@ def find_evidence(query, keys, sources, limit, enabled=None, also_try=(), topic=
 
 
 MIN_RELEVANCE = 0.4
-_MEDIA = re.compile(r"\b(images?|photos?|photographs?|pictures?|pics?|videos?|footage|clips?|screenshots?|"
+_MEDIA = re.compile(r"\b(images?|photos?|photographs?|pictures?|pics?|videos?|visuals?|footage|clips?|screenshots?|"
                     r"ai[- ]generated|deepfakes?|edited|doctored|altered)\b", re.I)
 MAX_REFERENCES = 2  # encyclopedia articles among the results, unless nothing else is found
 _WORD = re.compile(r"[a-z0-9%$]+")
@@ -603,6 +619,29 @@ def match_strength(item):
     else:
         strength = item.get("headline_match", item.get("relevance", 0.0))
     return round(max(0.0, min(1.0, strength)), 2)
+
+
+OUTDATED_AFTER_NEWS = 2  # trusted news reports, published later, that make a fact-check outdated
+OUTDATED_NEWS_STRENGTH = 0.7
+
+
+def outdated_fact_checks(items, stances, strengths):
+    """Indexes of fact-checks that rate the claim false but are older than at least 2
+    trusted news reports (from different sites) that later report it as fact. They
+    reviewed an earlier hoax, such as a false report of a death before the real one
+    ("Another hoax claims Queen Elizabeth II is dead", 2021, then her death in 2022),
+    not the event the news now reports. A fact-check newer than the news ("Senate did
+    NOT just confirm..." about an old confirmation) is never outdated."""
+    outdated = set()
+    for i, (item, stance) in enumerate(zip(items, stances)):
+        if item["kind"] != "fact_check" or stance not in ("REFUTES", "MIXED") or not item.get("date"):
+            continue
+        later = {other["domain"] for other, s, m in zip(items, stances, strengths)
+                 if other["kind"] == "news" and s == "SUPPORTS" and m >= OUTDATED_NEWS_STRENGTH
+                 and other.get("date", "") > item["date"]}
+        if len(later) >= OUTDATED_AFTER_NEWS:
+            outdated.add(i)
+    return outdated
 
 
 def fallback_stances(items):

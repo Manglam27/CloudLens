@@ -20,6 +20,9 @@ Pipeline:
 
 Configuration (Lambda environment variables):
     CHECKS_TABLE, CACHE_TABLE, SOURCES_TABLE, BUCKET_NAME
+    LLM_TABLE=CloudLensLLM, LLM_RPM=4, FALLBACK_MODEL_ID, FALLBACK_LLM_RPM=24, LLM_DEADLINE_SECONDS=75
+                                           per-model NVIDIA rate limits, answer cache and
+                                           fallback model (gate.py, llm.py)
     T_TRUE=70, T_FALSE=30, MIN_SOURCES=2, MAX_RESULTS=10  verdict limits and result budget
     EVIDENCE_ENABLED=true                  turns steps 3 and 4 on
     MODEL_ID                               NVIDIA model, default Nemotron 3 Ultra
@@ -37,10 +40,12 @@ from datetime import datetime, timezone
 import claim as rules
 import evidence
 import llm
+from gate import Gate
 from scoring import FALSE, TRUE, score_evidence
 
 MAX_OCR_CHARS = 4000
 RULES_NOTE = "The AI judge was busy, so only fact-check ratings were read; check again in a minute for a full result."
+BACKUP_NOTE = "Checked by a backup AI model while the main one was busy; check again later for its answer."
 LIGHT_LEVEL = 200  # gray level (0-255) from which a pixel counts as light text
 MIN_LINE_CONFIDENCE = 80  # Textract confidence (%) for a line to count as read
 MAX_PIXELS = 40_000_000  # larger photos skip the light-text reading
@@ -235,14 +240,37 @@ def lambda_handler(event, context):
         return
     evidence_enabled = os.environ.get("EVIDENCE_ENABLED", "false").lower() == "true"
     max_results = int(os.environ.get("MAX_RESULTS", "10"))
+    # Every check shares NVIDIA's limits through the CloudLensLLM table (gate.py), one
+    # budget per model; no LLM request starts after the deadline, so the result still
+    # arrives while the app waits.
+    started = time.time()
+    llm_table = _table("LLM_TABLE") if os.environ.get("LLM_TABLE") else None
+    primary, *fallbacks = llm.models()
+    llm.gates = {primary: Gate(llm_table, rpm=os.environ.get("LLM_RPM", "4"), name="main")}
+    for i, model in enumerate(fallbacks, start=1):
+        llm.gates[model] = Gate(llm_table, rpm=os.environ.get("FALLBACK_LLM_RPM", "24"), name=f"fallback{i}")
+    llm.set_deadline(started + float(os.environ.get("LLM_DEADLINE_SECONDS", "75")))
+    used_models = {}  # step -> model that answered it
+    timings, mark = {}, [time.time()]
+
+    def lap(stage):
+        now = time.time()
+        timings[stage] = round((now - mark[0]) * 1000)
+        mark[0] = now
+
     try:
         _update(key, status="READING_TEXT")
         lines = read_text(os.environ["BUCKET_NAME"], item["imageKey"])
         keys = _api_keys()
         llm.set_api_key(keys.get("nvidia"))
+        lap("ocrMs")
 
         _update(key, status="FINDING_CLAIM")
+        llm.last_model = None
         kind, claim, query, topic, used_llm = find_claim(lines) if lines else ("no_claim", None, "", "", True)
+        if used_llm and llm.last_model:
+            used_models["claim"] = llm.last_model
+        lap("claimMs")
         # A result is cached only if every step it needed ran without a fallback.
         complete = used_llm
 
@@ -260,27 +288,44 @@ def lambda_handler(event, context):
                         problem = "Fact-check search is not configured yet, so this claim cannot be verified."
                     elif not sources:
                         problem = "The fact-check search could not be completed. Please try again."
+        lap("searchMs")
 
         _update(key, status="SCORING")
         stances, strengths, reason = [], [], ""
-        # The model, if it did every LLM step this check needed; otherwise the rules.
-        judged_by = os.environ.get("MODEL_ID", llm.DEFAULT_MODEL) if used_llm else "rules"
+        judged_by = used_models.get("claim", primary) if used_llm else "rules"
         if sources:
             try:
+                llm.last_model = None
                 stances, strengths, reason = llm.judge_sources(claim, sources)
+                judged_by = used_models["judge"] = llm.last_model or primary
+                for i in evidence.outdated_fact_checks(sources, stances, strengths):
+                    stances[i], sources[i]["outdated"] = "RELATED", True
             except llm.LLMError:
                 traceback.print_exc()
+                stances = evidence.fallback_stances(sources)
+                strengths = [evidence.match_strength(s) for s in sources]
+                for i in evidence.outdated_fact_checks(sources, stances, strengths):
+                    stances[i], sources[i]["outdated"] = "RELATED", True
                 # Keyword rules can't tell a story that confirms the claim from one that only
                 # shares its words ("Vaccines do not cause autism"), so without the model they
                 # never back a claim up: only fact-check ratings against it count. The result
                 # is not cached, so checking again later gets the model's judgement.
-                stances = ["RELATED" if st == "SUPPORTS" else st for st in evidence.fallback_stances(sources)]
-                strengths = [evidence.match_strength(s) for s in sources]
+                stances = ["RELATED" if st == "SUPPORTS" else st for st in stances]
                 reason, complete, judged_by = evidence.summarize(sources, stances), False, "rules"
                 reason = (reason + " " if reason else "") + RULES_NOTE
+        # Only answers from the main model are kept for the next check of this image;
+        # a fallback model's answer is shown but the main model gets to try again.
+        if any(m != primary for m in used_models.values()):
+            complete = False
+            if used_models.get("judge", primary) != primary:
+                reason = (reason + " " if reason else "") + BACKUP_NOTE
+        lap("judgeMs")
         scored = score_evidence(
             [{"domain": s["domain"], "weight": s["weight"], "stance": st, "kind": s["kind"], "strength": m,
-              "about_media": s.get("about_media", False)}
+              "about_media": s.get("about_media", False),
+              # A fact-check outranks the news only if its own rating or headline agrees with the
+              # AI's reading of it (scoring.py), so one misread fact-check can't set the news aside.
+              "confirmed": s["kind"] != "fact_check" or evidence.fallback_stance(s) == st}
              for s, st, m in zip(sources, stances, strengths)],
             int(os.environ.get("T_TRUE", "70")), int(os.environ.get("T_FALSE", "30")),
             int(os.environ.get("MIN_SOURCES", "2")))
@@ -300,8 +345,17 @@ def lambda_handler(event, context):
             "certainty": round(scored["certainty"] * 100),
             "judgedBy": judged_by,
         }
-        _update(key, **result, kind=kind, providers=report, ocrText="\n".join(lines)[:MAX_OCR_CHARS],
-                status="DONE", finishedAt=_now())
+        timings["llmWaitMs"] = round(sum(g.waited for g in llm.gates.values()) * 1000)
+        timings["totalMs"] = round((time.time() - started) * 1000)
+        # For review and testing only (the app shows `sources`): what the model was asked
+        # to search for, and every source judged, off-topic ones included.
+        details = {"searchQuery": query or "", "topicQuery": topic or "", "timings": timings, "models": used_models,
+                   "judged": [{"domain": s["domain"], "kind": s["kind"], "stance": st, "strength": round(m * 100),
+                               "title": s["title"][:200], "date": s.get("date", ""),
+                               "outdated": bool(s.get("outdated"))}
+                              for s, st, m in zip(sources, stances, strengths)]}
+        _update(key, **result, **details, kind=kind, providers=report,
+                ocrText="\n".join(lines)[:MAX_OCR_CHARS], status="DONE", finishedAt=_now())
         if complete:
             _table("CACHE_TABLE").put_item(Item={"imageHash": item["imageHash"], **result,
                                                  "resultsVersion": os.environ.get("RESULTS_VERSION", "1")})

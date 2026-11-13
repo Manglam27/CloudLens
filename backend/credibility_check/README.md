@@ -50,16 +50,46 @@ app ── POST /checks {imageKey} ──► Check API ── async ──► Ch
 
 | | |
 | --- | --- |
-| Model | `nvidia/nemotron-3-ultra-550b-a55b` (NVIDIA Nemotron 3 Ultra, the largest model in NVIDIA's API catalog), set by `MODEL_ID` |
+| Main model | `nvidia/nemotron-3-ultra-550b-a55b` (NVIDIA Nemotron 3 Ultra), set by `MODEL_ID` |
+| Backup models | `google/gemma-4-31b-it`, then `nvidia/nemotron-3.5-lightning-30b-a3b`, set by `FALLBACK_MODEL_ID` |
 | API | `https://integrate.api.nvidia.com/v1/chat/completions` (OpenAI-compatible), key in SSM at `/cloudlens/nvidia-api-key` |
 | Settings | temperature 0 and thinking switched off (`chat_template_kwargs.enable_thinking = false`), for repeatable, fast answers |
-| Calls per check | 2: find the claim, judge the sources |
+| Calls per check | 2: find the claim, judge the sources (0 when both answers are already stored) |
 
 Each reply must be one JSON object of the shape given in the prompt. Anything
-else, a cut-off reply or a busy server is asked again once (the hosted model
-sometimes returns an empty reply under load); if that fails too, or the request
-times out, the worker falls back to the rules for that step. The model judges only from the sources it is given,
-never from its own memory.
+else or a cut-off reply is asked again once (hosted models sometimes return an
+empty reply under load). The model judges only from the sources it is given,
+never from its own memory. The judge answers one question per source,
+"according to this source, is the claim true?" (TRUE, FALSE, PARTLY or
+NOT_ADDRESSED), which models get right far more often than "does it support or
+refute the claim", and is shown the publication date of each source.
+
+### Staying within NVIDIA's rate limit
+
+NVIDIA's free tier allows about 30 requests a minute per key, but on this key
+Nemotron 3 Ultra accepts a burst of about 6 and then sustains only 3 to 4 a
+minute; each model has its own budget. So the AI is never a bottleneck:
+
+1. **Shared budget:** every request takes a slot in a DynamoDB counter
+   (`CloudLensLLM` table, `gate.py`) shared by all running checks: at most
+   `LLM_RPM` (4) a minute for the main model and `FALLBACK_LLM_RPM` (24) for
+   each backup, counted in 10-second windows. A request that finds no free
+   slot waits for the next window instead of failing.
+2. **Model chain (`llm.py`):** the main model gets 8 seconds to find a slot.
+   If NVIDIA answers "busy" (HTTP 429), every check skips it for 60 seconds;
+   if a backup model takes over 20 seconds, every check skips it for 2
+   minutes. The next model in the chain answers instead. The last one waits
+   and retries a 429 after 3, 6 and 10 seconds while the check's 75-second
+   deadline allows.
+3. **Answer cache:** the answer to an identical request is stored for 30 days
+   and reused, so a repeated check costs nothing and always gets the same
+   answer. Answers of the last-resort model are not kept.
+4. **Last resort:** only if every model fails do the rules judge (see below).
+
+A result judged by a backup model says so ("Checked by a backup AI model while
+the main one was busy...") and is not kept in the result cache, so checking
+the same image again later gets the main model's answer. Each check records the
+time it spent waiting for a slot and which model answered each step.
 
 ## Evidence providers
 
@@ -121,6 +151,15 @@ may be old stories about a real event that a post presents as new ("the Senate
 of the splashdown are AI-generated") is the exception: it says nothing about
 whether the event happened, so it votes with the rest and cannot set the news
 aside or decide alone.
+
+**Outdated fact-checks.** Every source carries its publication date. A
+fact-check that rated the claim false is set aside (shown as Related) when at
+least 2 trusted news reports from different sites, published after it, state the
+claim as fact. It reviewed an earlier hoax, not the event the news reports: in
+testing, "Another hoax claims Queen Elizabeth II is dead" (2021) and "Pope
+Francis is NOT dead" outvoted the BBC and Reuters reports of the real deaths
+until this rule was added. A fact-check newer than the news ("Senate did NOT
+*just* confirm...", about a confirmation years earlier) is never set aside.
 
 **Verdict:** True at 70 or more, False at 30 or less, Unverified in between. A
 True or False verdict also needs 2 independent sites on that side, or one
@@ -219,15 +258,16 @@ deploy.py                         creates or updates every AWS resource below
 
 | Resource | Name |
 | --- | --- |
-| DynamoDB | `CloudLensChecks` (PK `userId`, SK `checkId`), `CloudLensResultCache` (PK `imageHash`), `CloudLensTrustedSources` (PK `domain`), on-demand |
-| Lambda | `cloudlens-check-api` (10 s, 256 MB), `cloudlens-check-worker` (120 s, 512 MB), Python 3.13 |
+| DynamoDB | `CloudLensChecks` (PK `userId`, SK `checkId`), `CloudLensResultCache` (PK `imageHash`), `CloudLensTrustedSources` (PK `domain`), `CloudLensLLM` (PK `key`; rate-limit slots, cool-downs and stored answers, deleted by TTL), on-demand |
+| Lambda | `cloudlens-check-api` (10 s, 256 MB), `cloudlens-check-worker` (180 s, 512 MB, with Pillow for the second OCR reading), Python 3.13 |
 | IAM | `cloudlens-check-api-role`, `cloudlens-check-worker-role`, least privilege |
 | API Gateway | JWT authorizer `cloudlens-cognito` and the three routes above |
 | SSM | the four API keys above, as SecureStrings |
 
 Worker settings (Lambda environment variables): `T_TRUE=70`, `T_FALSE=30`,
-`MIN_SOURCES=2`, `MAX_RESULTS=10`, `EVIDENCE_ENABLED=true`, `MODEL_ID`, `RESULTS_VERSION`, and the
-names of the four key parameters.
+`MIN_SOURCES=2`, `MAX_RESULTS=10`, `EVIDENCE_ENABLED=true`, `MODEL_ID`, `FALLBACK_MODEL_ID`,
+`LLM_TABLE=CloudLensLLM`, `LLM_RPM=4`, `FALLBACK_LLM_RPM=24`, `LLM_DEADLINE_SECONDS=75`,
+`RESULTS_VERSION`, and the names of the four key parameters.
 
 ## Test, build, deploy
 

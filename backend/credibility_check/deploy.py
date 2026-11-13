@@ -8,7 +8,8 @@ created. Needs the AWS CLI signed in to the CloudLens account. The Cognito user
 pool and app client IDs are read from lib/amplifyconfiguration.dart.
 
 Resources:
-    DynamoDB   CloudLensChecks (userId, checkId), CloudLensResultCache (imageHash)
+    DynamoDB   CloudLensChecks (userId, checkId), CloudLensResultCache (imageHash),
+               CloudLensLLM (key; NVIDIA rate-limit slots and stored answers, with TTL)
     IAM        cloudlens-check-api-role, cloudlens-check-worker-role
     Lambda     cloudlens-check-api, cloudlens-check-worker (Python 3.13)
     API        routes POST /checks, GET /checks, GET /checks/{checkId} on
@@ -32,8 +33,16 @@ CHECKS_TABLE = "CloudLensChecks"
 CACHE_TABLE = "CloudLensResultCache"
 # Saved results are reused only if made by this version of the checker. Raise it
 # whenever the claim, judging or scoring logic changes, so old results are re-run.
-RESULTS_VERSION = "5"
+RESULTS_VERSION = "9"
 SOURCES_TABLE = "CloudLensTrustedSources"
+LLM_TABLE = "CloudLensLLM"
+# NVIDIA's free tier: about 30 requests a minute per key, but measured on this key Nemotron 3 Ultra
+# allows a burst of ~6 and then sustains only 3-4 a minute. The fallbacks have their own budgets:
+# Gemma 4 31B (20 a minute without a 429, and judged all the hard test cases right), then
+# Nemotron 3.5 Lightning (fast, but flips stances more often).
+LLM_RPM = "4"
+FALLBACK_MODEL_ID = "google/gemma-4-31b-it,nvidia/nemotron-3.5-lightning-30b-a3b"
+FALLBACK_LLM_RPM = "24"
 API_FN, WORKER_FN = "cloudlens-check-api", "cloudlens-check-worker"
 AUTHORIZER = "cloudlens-cognito"
 MODEL_ID = "nvidia/nemotron-3-ultra-550b-a55b"  # NVIDIA Nemotron 3 Ultra on build.nvidia.com
@@ -84,6 +93,12 @@ def ensure_table(name, keys):
         "--attribute-definitions", json.dumps(attrs), "--key-schema", json.dumps(schema))
     aws("dynamodb", "wait", "table-exists", "--table-name", name)
     print(f"  table {name}: created")
+
+
+def ensure_ttl(name, attribute):
+    """Lets DynamoDB delete items once the time in `attribute` has passed."""
+    aws("dynamodb", "update-time-to-live", "--table-name", name, "--time-to-live-specification",
+        json.dumps({"Enabled": True, "AttributeName": attribute}), ok_codes=("TimeToLive is already enabled",))
 
 
 def ensure_role(name, policy):
@@ -187,6 +202,8 @@ def main():
     ensure_table(CHECKS_TABLE, ["userId", "checkId"])
     ensure_table(CACHE_TABLE, ["imageHash"])
     ensure_table(SOURCES_TABLE, ["domain"])
+    ensure_table(LLM_TABLE, ["key"])
+    ensure_ttl(LLM_TABLE, "expiresAt")
     from sources import seed_missing  # imported here: sources.py imports this module
     print(f"  trusted sources: {seed_missing()} missing entries added")
 
@@ -205,6 +222,8 @@ def main():
         {"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": photos},
         {"Effect": "Allow", "Action": ["textract:DetectDocumentText"], "Resource": "*"},
         {"Effect": "Allow", "Action": ["dynamodb:Scan"], "Resource": table(SOURCES_TABLE)},
+        {"Effect": "Allow", "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"],
+         "Resource": table(LLM_TABLE)},
         {"Effect": "Allow", "Action": ["ssm:GetParameter"],
          "Resource": [f"arn:aws:ssm:{REGION}:{account}:parameter{p}" for p in KEY_PARAMS.values()]},
     ])
@@ -214,8 +233,10 @@ def main():
               "RESULTS_VERSION": RESULTS_VERSION}
     ensure_function(WORKER_FN, worker_role, HERE / "dist" / "check_worker.zip",
                     {**common, "SOURCES_TABLE": SOURCES_TABLE, "T_TRUE": "70", "T_FALSE": "30", "MIN_SOURCES": "2",
-                     "MAX_RESULTS": "10", "EVIDENCE_ENABLED": "true", "MODEL_ID": MODEL_ID, **KEY_PARAMS},
-                    timeout=120, memory=512)  # two LLM calls of up to 50 s each
+                     "MAX_RESULTS": "10", "EVIDENCE_ENABLED": "true", "MODEL_ID": MODEL_ID,
+                     "LLM_TABLE": LLM_TABLE, "LLM_RPM": LLM_RPM, "FALLBACK_MODEL_ID": FALLBACK_MODEL_ID,
+                     "FALLBACK_LLM_RPM": FALLBACK_LLM_RPM, "LLM_DEADLINE_SECONDS": "75", **KEY_PARAMS},
+                    timeout=180, memory=512)  # no LLM call starts after 75 s; one may then take up to 50 s
     ensure_function(API_FN, api_role, HERE / "dist" / "check_api.zip",
                     {**common, "WORKER_FUNCTION": WORKER_FN}, timeout=10, memory=256)
 
