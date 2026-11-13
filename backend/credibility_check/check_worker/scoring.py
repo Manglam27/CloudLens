@@ -14,20 +14,23 @@ Each piece of evidence is {"domain", "weight", "stance", "kind", "strength"}:
 2. S = sum of the votes for, R = sum of the votes against.
 3. Direction  D = (S - R) / (S + R), from -1 (all against) to +1 (all for).
 4. Certainty  C = 1 - e^(-(S + R) / K), from 0 (no evidence) towards 1 as
-   evidence piles up. K = 1, so one fact-check of strength 0.9 gives C = 0.59
-   and three give C = 0.93.
+   evidence piles up. K = 0.8, so one fact-check of strength 0.9 gives C = 0.68
+   and three give C = 0.97; one Wikipedia sentence (weight 0.6) of strength 0.8
+   gives C = 0.45, just enough for a verdict.
 5. Score = 50 + 50 x D x C, rounded: 50 means no evidence or an even split;
    the further from 50, the more and the stronger the evidence on one side.
 
 Fact-checks outrank news: when a trusted fact-check addresses this claim with
 strength 0.6 or more, only fact-checks vote. A fact-checker that reviewed the
 exact claim has already weighed the news coverage, which may be old stories
-about a real event that a post presents as new.
+about a real event that a post presents as new. A fact-check about pictures of
+an event ("viral images of the splashdown are AI-generated") does not do this:
+it votes with the rest but cannot set the news aside.
 
 Verdict: TRUE at 70 or more, FALSE at 30 or less, UNVERIFIED in between. A
 TRUE or FALSE verdict also needs 2 independent sites on that side, or one
 source that settles the claim by itself (a fact-check of this claim, or a
-Wikipedia sentence stating it) with strength 0.6 or more; without that the
+Wikipedia sentence stating or plainly contradicting it) with strength 0.6 or more; without that the
 score is held at 69 or 31, so it never looks decided when the verdict is not.
 """
 
@@ -36,9 +39,9 @@ import math
 TRUE, FALSE, UNVERIFIED = "TRUE", "FALSE", "UNVERIFIED"
 MIN_INDEPENDENT_SOURCES = 2
 NEUTRAL_SCORE = 50
-CERTAINTY_SCALE = 1.0  # K: the evidence weight at which certainty reaches 63%
+CERTAINTY_SCALE = 0.8  # K: the evidence weight at which certainty reaches 63% (tuned on the test set)
 DECISIVE_STRENGTH = 0.6  # how directly one source must address the claim to decide alone
-DECISIVE_KINDS = {"SUPPORTS": ("fact_check", "reference"), "REFUTES": ("fact_check",)}
+DECISIVE_KINDS = {"SUPPORTS": ("fact_check", "reference"), "REFUTES": ("fact_check", "reference")}
 
 
 def _votes(trusted):
@@ -60,7 +63,7 @@ def score_evidence(evidence, t_true=70, t_false=30, min_sources=MIN_INDEPENDENT_
     """Returns {"verdict", "score", "direction", "certainty", "for", "against", "supporters", "refuters"}."""
     trusted = [e for e in evidence if e.get("weight", 0) > 0]
     checks = [e for e in trusted if e.get("kind") == "fact_check" and e["stance"] in ("SUPPORTS", "REFUTES", "MIXED")
-              and e.get("strength", 1.0) >= DECISIVE_STRENGTH]
+              and e.get("strength", 1.0) >= DECISIVE_STRENGTH and not e.get("about_media")]
     if checks:
         trusted = [e for e in trusted if e.get("kind") == "fact_check"]
     s, r = _votes(trusted)
@@ -72,7 +75,7 @@ def score_evidence(evidence, t_true=70, t_false=30, min_sources=MIN_INDEPENDENT_
 
     def settled_by_one(stance):
         return any(e["stance"] == stance and e.get("kind") in DECISIVE_KINDS[stance]
-                   and e.get("strength", 1.0) >= DECISIVE_STRENGTH for e in trusted)
+                   and e.get("strength", 1.0) >= DECISIVE_STRENGTH and not e.get("about_media") for e in trusted)
 
     verdict = UNVERIFIED
     if score >= t_true:

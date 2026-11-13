@@ -54,14 +54,17 @@ with no social-media integration.
 1. **Request:** the user taps **Check** on a cloud photo, or **Upload and Check**
    on a local one. The server saves a job and returns at once; the app polls every
    2 seconds and shows the current step.
-2. **Read text:** Amazon Textract extracts the text lines from the screenshot.
+2. **Read text:** Amazon Textract extracts the text lines from the screenshot,
+   reading it a second time as dark-on-white text so white meme captions are
+   read too.
 3. **Find the claim:** an LLM, NVIDIA Nemotron 3 Ultra, keeps the checkable
    statement, or returns none for opinions and jokes. Rules that remove names,
    @handles, times and like counts are the fallback.
 4. **Find evidence:** Google Fact Check Tools, Google News, Bing News,
    Wikipedia, NewsAPI and The Guardian are searched in parallel. Only sites in
    the trusted-source table (fact-checkers, wire services, news outlets and
-   Wikipedia, 109 in all) count, at most 8 results.
+   Wikipedia, 109 in all) count, at most 10 results, of which fact-checks fill at
+   most half so news reporting the event is always judged too.
 5. **Judge the sources:** the LLM labels each source Supports, Refutes, Mixed or
    Unrelated, rates how directly it settles the claim (its strength, 0 to 1) and
    writes a short reason. Rules that read fact-check ratings, headlines and
@@ -78,13 +81,16 @@ with no social-media integration.
   settles this exact claim, from 0 to 1.
 - **Vote** = weight × strength; a site counts once. **S** adds up the votes for
   the claim and **R** the votes against (a "Half True" rating gives half to each).
-- **Direction** D = (S − R) ÷ (S + R) and **certainty** C = 1 − e^(−(S + R)).
+- **Direction** D = (S − R) ÷ (S + R) and **certainty** C = 1 − e^(−(S + R) ÷ 0.8).
 - **Score = 50 + 50 × D × C.** 50 means no evidence or an even split; more and
   stronger evidence on one side moves the score further from 50. One strong
-  fact-check rating a claim false gives about 20, two give 8, three give 3.
+  fact-check rating a claim false gives about 16, two give 5, three give 2.
+- When a trusted fact-check addresses the exact claim, only fact-checks vote:
+  it has already weighed the news, which may be an old event presented as new.
 - **True:** score ≥ 70; **False:** score ≤ 30; **Unverified:** in between. True
   or False also needs 2 independent trusted sources on that side, or one
-  published fact-check (or, for True, a Wikipedia sentence) of this claim;
+  published fact-check of this claim (or a Wikipedia sentence stating or
+  contradicting it);
   otherwise the score is held at 69 or 31.
 
 The backend README has the full rules and worked examples.

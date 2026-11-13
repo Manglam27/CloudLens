@@ -14,12 +14,15 @@ before use. The API key comes from SSM through set_api_key().
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 DEFAULT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
 TIMEOUT_SECONDS = 50
+RETRIES = 1
+RETRY_DELAY_SECONDS = 1.0
 STANCES = ("SUPPORTS", "REFUTES", "MIXED", "UNRELATED")
 
 _api_key = None
@@ -27,6 +30,14 @@ _api_key = None
 
 class LLMError(Exception):
     """The model could not produce a usable answer."""
+
+
+class LLMTimeout(LLMError):
+    """The request took too long; not retried, since a retry would outlast the app's wait."""
+
+
+class LLMBusy(LLMError):
+    """The API's rate limit was reached (HTTP 429); not retried, since that only adds load."""
 
 
 def set_api_key(key):
@@ -42,14 +53,38 @@ def _post(body):
         with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
+        if e.code == 429:
+            raise LLMBusy("NVIDIA API returned HTTP 429") from None
         raise LLMError(f"NVIDIA API returned HTTP {e.code}") from None
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as e:
+    except TimeoutError:
+        raise LLMTimeout("NVIDIA API request timed out") from None
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, TimeoutError):
+            raise LLMTimeout("NVIDIA API request timed out") from None
+        raise LLMError(f"NVIDIA API request failed: {type(e).__name__}") from None
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
         raise LLMError(f"NVIDIA API request failed: {type(e).__name__}") from None
 
 
-def _ask(system, user, max_tokens):
+def _ask(system, user, max_tokens, check=lambda result: result):
+    """The model's JSON answer, after check(answer) accepts it. A reply that is not
+    usable (no JSON, cut off, wrong shape) or a busy server is retried once: the
+    hosted model sometimes returns an empty or broken reply under load."""
     if not _api_key:
         raise LLMError("No NVIDIA API key is configured")
+    for attempt in range(1 + RETRIES):
+        try:
+            return check(_ask_once(system, user, max_tokens))
+        except (LLMTimeout, LLMBusy):
+            raise
+        except LLMError as e:
+            if attempt == RETRIES:
+                raise
+            print(f"LLM reply not usable ({e}); asking again")
+            time.sleep(RETRY_DELAY_SECONDS)
+
+
+def _ask_once(system, user, max_tokens):
     reply = _post({
         "model": os.environ.get("MODEL_ID", DEFAULT_MODEL),
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -92,23 +127,29 @@ For a claim, rewrite it as one clear, self-contained English sentence: keep name
 resolve words like "this" or "he" from the surrounding text, and add nothing that the post does not say. Keep \
 words about timing such as "just", "today", "now", "breaking" or "new", and any dates, because a real event \
 presented as new is a common false claim. Also give \
-a short search_query of 3 to 8 keywords from the claim, as a fact-check search engine would match it. For anything \
-other than a claim, return an empty claim and an empty search_query.
+a short search_query of 3 to 8 keywords from the claim, as a fact-check search engine would match it, and a \
+topic_query of 2 to 4 words naming the story the way fact-checkers and news headlines name it (for example \
+"moon landing hoax", "Biden gas stove ban", "Key Bridge collapse"). For anything other than a claim, return an \
+empty claim, search_query and topic_query.
 
 Reply with only this JSON object and nothing else:
-{"kind": "claim" | "opinion" | "satire" | "no_claim", "claim": "...", "search_query": "..."}"""
+{"kind": "claim" | "opinion" | "satire" | "no_claim", "claim": "...", "search_query": "...", "topic_query": "..."}"""
 
 
-def extract_claim(lines):
-    """Returns {"kind", "claim", "search_query"}."""
-    text = "\n".join(lines)
-    result = _ask(CLAIM_SYSTEM, f"<ocr_text>\n{text}\n</ocr_text>", max_tokens=512)
+def _claim_answer(result):
     kind = result.get("kind")
     if kind not in ("claim", "opinion", "satire", "no_claim"):
         raise LLMError("The model returned an unknown kind of post")
     if kind == "claim" and not str(result.get("claim", "")).strip():
         raise LLMError("The model classified the text as a claim but returned no claim")
-    return {"kind": kind, "claim": str(result.get("claim", "")), "search_query": str(result.get("search_query", ""))}
+    return {"kind": kind, "claim": str(result.get("claim", "")), "search_query": str(result.get("search_query", "")),
+            "topic_query": str(result.get("topic_query", ""))}
+
+
+def extract_claim(lines):
+    """Returns {"kind", "claim", "search_query", "topic_query"}."""
+    text = "\n".join(lines)
+    return _ask(CLAIM_SYSTEM, f"<ocr_text>\n{text}\n</ocr_text>", max_tokens=512, check=_claim_answer)
 
 
 JUDGE_SYSTEM = """You compare a claim with sources found for it. There are three kinds of source:
@@ -125,10 +166,15 @@ title says the claim is not true as stated (for example "did NOT", "fake", or an
 article that reports the claim as false or debunked; or an encyclopedia article whose text plainly contradicts it.
 - MIXED: a fact-check of the same claim with an in-between rating, such as half true or missing context.
 - UNRELATED: a source about a different claim, or one that only mentions the topic without confirming or denying \
-the claim.
+the claim. A fact-check that a particular photo, video or post about an event is fake, edited or AI-generated is \
+about that picture or post, not about whether the event happened: it is UNRELATED to a claim that the event \
+happened, unless it also says the event itself did not happen. For example, a fact-check rating "Viral images \
+show the crew splashing down" misleading because the images are AI-generated is UNRELATED to the claim "The crew \
+splashed down".
 
 Also give each source a strength from 0.0 to 1.0: how directly and clearly it settles this exact claim. 1.0 is a \
-fact-check of exactly this claim, or a source that states exactly this as fact; 0.5 is a source that addresses the \
+fact-check of exactly this claim, or a source that states exactly this as fact; a fact-check of the same \
+hoax, offer or rumour worded differently is still 0.8 or more; 0.5 is a source that addresses the \
 claim only partly or indirectly; 0.2 is a source that barely touches it. Use 0.0 for UNRELATED.
 
 Then write one short, plain sentence for a general audience that summarizes what the sources found, such as \
@@ -157,7 +203,12 @@ def judge_sources(claim, sources):
 
     listing = "\n\n".join(describe(i, s) for i, s in enumerate(sources, start=1))
     user = f"<claim>\n{claim}\n</claim>\n\n<sources>\n{listing}\n</sources>"
-    result = _ask(JUDGE_SYSTEM, user, max_tokens=1500)
+    def check(result):
+        if not isinstance(result.get("sources"), list):
+            raise LLMError("The model's judgement has no list of sources")
+        return result
+
+    result = _ask(JUDGE_SYSTEM, user, max_tokens=2000, check=check)
     by_index = {}
     for item in result.get("sources", []):
         if isinstance(item, dict) and item.get("stance") in STANCES and isinstance(item.get("index"), int):

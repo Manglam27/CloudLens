@@ -19,22 +19,32 @@ app ── POST /checks {imageKey} ──► Check API ── async ──► Ch
                                                     → SEARCHING_SOURCES → SCORING → DONE / FAILED
 ```
 
-1. **Read text:** Amazon Textract returns the text lines of the screenshot.
+1. **Read text:** Amazon Textract reads the screenshot twice in parallel: as it
+   is, and as a light-text version (every near-white pixel turned black, the
+   rest white). The reading with more confidently read words is used. Meme
+   captions, white letters with a black outline over a picture, are read poorly
+   or not at all the first way and fully the second way.
 2. **Find the claim:** the LLM (NVIDIA Nemotron 3 Ultra, see below) picks the
-   checkable statement and a 3 to 8 word search query, or says the post is an
+   checkable statement, a 3 to 8 word search query and a 2 to 4 word topic
+   ("moon landing hoax", "Key Bridge collapse"), or says the post is an
    opinion, satire or has nothing to check. Without the LLM, rules in `claim.py`
    drop names, @handles, times and like counts and keep the post's first full
    sentence.
-3. **Search evidence:** every provider below runs in parallel. Only results from
-   sites in the trusted-source table are kept, ranked by how many of the claim's
-   words they share, at most 8, preferring different sites.
+3. **Search evidence:** every provider below runs in parallel; a busy provider
+   (HTTP 429 or 5xx) or a timeout is retried twice after a short wait. Only
+   results from sites in the trusted-source table are kept, ranked by how
+   closely they match the claim or its topic, at most 10, preferring different
+   sites. Fact-checks fill at most half of the places and Wikipedia at most 2,
+   so news reporting the event is always judged too.
 4. **Judge each source:** the LLM gives every source a stance (Supports,
    Refutes, Mixed or Unrelated) and a **strength** from 0 to 1: how directly it
    settles this exact claim. Without the LLM, rules do the same from the
    evidence itself (see [Judging without the LLM](#judging-without-the-llm)).
 5. **Score:** see [Scoring](#scoring). A result is cached per image only when
    every step ran without a fallback, so the same screenshot then always gets
-   the same answer.
+   the same answer. Each cached result records `RESULTS_VERSION` (set in
+   `deploy.py`); after a change to the claim, judging or scoring logic the
+   version is raised, and results from an older checker are run again.
 
 ## The LLM
 
@@ -45,19 +55,20 @@ app ── POST /checks {imageKey} ──► Check API ── async ──► Ch
 | Settings | temperature 0 and thinking switched off (`chat_template_kwargs.enable_thinking = false`), for repeatable, fast answers |
 | Calls per check | 2: find the claim, judge the sources |
 
-Each reply must be one JSON object of the shape given in the prompt; anything
-else, a cut-off reply, a missing key or an API error makes the worker fall back
-to the rules for that step. The model judges only from the sources it is given,
+Each reply must be one JSON object of the shape given in the prompt. Anything
+else, a cut-off reply or a busy server is asked again once (the hosted model
+sometimes returns an empty reply under load); if that fails too, or the request
+times out, the worker falls back to the rules for that step. The model judges only from the sources it is given,
 never from its own memory.
 
 ## Evidence providers
 
 | Provider | Key | What it adds |
 | --- | --- | --- |
-| Google Fact Check Tools API | `/cloudlens/google-factcheck-api-key` | Rated fact-checks; searched with three phrasings because its matching is picky |
+| Google Fact Check Tools API | `/cloudlens/google-factcheck-api-key` | Rated fact-checks; searched with the keywords, the claim, its topic and its core words, because its matching is picky (a whole sentence often finds nothing) |
 | Google News RSS | none | Fact-check articles and news reports from many outlets |
 | Bing News RSS | none | The same from Bing's index, with summaries |
-| Wikipedia API | none | Opening paragraphs of the articles the claim names, for settled facts ("the capital of Australia is Canberra") |
+| Wikipedia API | none | Opening paragraphs of the articles the claim names and of the best matches for its keywords and topic, for settled facts ("the capital of Australia is Canberra") |
 | NewsAPI.org | `/cloudlens/newsapi-key` (optional) | News from trusted domains; free plan shows articles a day late |
 | The Guardian Content API | `/cloudlens/guardian-api-key` (optional) | Guardian reporting |
 
@@ -95,32 +106,53 @@ rules).
    Mixed rating gives half its vote to each side.
 2. **S** = sum of the votes for the claim, **R** = sum of the votes against.
 3. **Direction** D = (S − R) ÷ (S + R), from −1 (all against) to +1 (all for).
-4. **Certainty** C = 1 − e^(−(S + R)), from 0 with no evidence towards 1 as
-   strong evidence piles up.
+4. **Certainty** C = 1 − e^(−(S + R) / K) with K = 0.8, from 0 with no
+   evidence towards 1 as strong evidence piles up.
 5. **Score** = 50 + 50 × D × C, rounded.
 
 So 50 means no evidence or an even split, and the further a score is from 50,
 the more evidence, and the stronger, there is on one side.
 
+**Fact-checks outrank news.** When a trusted fact-check addresses this claim
+(Supports, Refutes or Mixed, strength 0.6 or more), only fact-checks vote. A
+fact-checker that reviewed the exact claim has already weighed the news, which
+may be old stories about a real event that a post presents as new ("the Senate
+*just* confirmed..."). A fact-check about pictures of an event ("viral images
+of the splashdown are AI-generated") is the exception: it says nothing about
+whether the event happened, so it votes with the rest and cannot set the news
+aside or decide alone.
+
 **Verdict:** True at 70 or more, False at 30 or less, Unverified in between. A
 True or False verdict also needs 2 independent sites on that side, or one
 source that settles the claim by itself (a fact-check of this claim, or a
-Wikipedia sentence stating it) with strength 0.6 or more. Without that, the
-score is held at 69 or 31, so it never looks decided when the verdict is not.
+Wikipedia sentence stating or plainly contradicting it) with strength 0.6 or
+more. Without that, the score is held at 69 or 31, so it never looks decided
+when the verdict is not.
 
-**Worked examples** (fact-checkers and wire services weigh 1.0, outlets 0.6):
+**Worked examples** (fact-checkers and wire services weigh 1.0, outlets and
+Wikipedia 0.6):
 
 | Evidence | S | R | D | C | Score | Verdict |
 | --- | --- | --- | --- | --- | --- | --- |
 | Nothing found | 0 | 0 | 0 | 0 | 50 | Unverified |
-| 1 fact-check "False", strength 0.9 | 0 | 0.9 | −1 | 0.59 | 20 | False |
-| 2 fact-checks "False", strength 0.9 | 0 | 1.8 | −1 | 0.83 | 8 | False |
-| 3 fact-checks "False", strength 0.9 | 0 | 2.7 | −1 | 0.93 | 3 | False |
-| 1 news outlet backs it, strength 0.9 | 0.54 | 0 | +1 | 0.42 | 71 → 69 | Unverified (needs a 2nd site) |
-| 2 news outlets back it, strength 0.9 | 1.08 | 0 | +1 | 0.66 | 83 | True |
-| 2 wire services back it, strength 1.0 | 2.0 | 0 | +1 | 0.86 | 93 | True |
-| 1 fact-check "False" (0.9) and 1 outlet backs it (0.8) | 0.48 | 0.9 | −0.30 | 0.75 | 39 | Unverified, leans false |
-| 1 fact-check "Half true", strength 0.9 | 0.45 | 0.45 | 0 | 0.59 | 50 | Unverified |
+| 1 fact-check "False", strength 0.9 | 0 | 0.9 | −1 | 0.68 | 16 | False |
+| 2 fact-checks "False", strength 0.9 | 0 | 1.8 | −1 | 0.89 | 5 | False |
+| 3 fact-checks "False", strength 0.9 | 0 | 2.7 | −1 | 0.97 | 2 | False |
+| 1 Wikipedia sentence contradicts it, strength 0.9 | 0 | 0.54 | −1 | 0.49 | 25 | False |
+| 1 news outlet backs it, strength 0.9 | 0.54 | 0 | +1 | 0.49 | 75 → 69 | Unverified (needs a 2nd site) |
+| 2 news outlets back it, strength 0.9 | 1.08 | 0 | +1 | 0.74 | 87 | True |
+| 2 wire services back it, strength 1.0 | 2.0 | 0 | +1 | 0.92 | 96 | True |
+| 1 fact-check "False" (0.9) and 1 outlet backs it (0.8) | 0 | 0.9 | −1 | 0.68 | 16 | False (fact-checks outrank news) |
+| 1 fact-check "False" about AI images (0.9) and 9 outlets back it (0.8) | 4.64 | 0.9 | +0.68 | 1.0 | 84 | True |
+| 1 fact-check "Half true", strength 0.9 | 0.45 | 0.45 | 0 | 0.68 | 50 | Unverified |
+
+**Why 70 and 30, and K = 0.8:** on the test set below, every claim the checker
+got right scored 78 or more (true) or 22 or less (false); no correct verdict
+fell between 23 and 77. So 70 and 30 sit inside that gap with a margin of 8 on
+each side, and 65/35 or 60/40 changed no verdict. K = 0.8 (instead of 1) lets
+one strong Wikipedia sentence, weight 0.6 × strength 0.8 or more, reach a
+verdict; on the test set it turned 2 Unverified into right answers and no
+answer into a wrong one.
 
 The result stores what went into the score: each source's weight and strength
 (as percentages), the certainty, and `judgedBy` (the model, or `rules`).
@@ -141,6 +173,17 @@ When the LLM is not available, `evidence.py` judges each source by rules:
 - **Wikipedia:** supports the claim when one sentence of the main article about
   its subject states it, in the present tense. Strength = the share of the
   claim's words in that sentence.
+
+**The rules never back a claim up.** Shared keywords are not support: on the
+test set the rules read "Vaccines do not cause autism" as backing "the MMR
+vaccine causes autism", and "Sydney is the capital of New South Wales" as
+backing "Sydney is the capital of Australia". So when the model can't judge
+(it was busy or its reply was unusable twice), every source the rules would
+count as support is shown as related instead. Only fact-check ratings against
+the claim count, which can still give False. The reason ends with "The AI judge
+was busy...", and the result is not cached, so checking again a minute later
+gets the full judgement. A rate-limit reply from NVIDIA (HTTP 429) is not
+retried, since that only adds load.
 
 ## API
 
@@ -183,7 +226,7 @@ deploy.py                         creates or updates every AWS resource below
 | SSM | the four API keys above, as SecureStrings |
 
 Worker settings (Lambda environment variables): `T_TRUE=70`, `T_FALSE=30`,
-`MIN_SOURCES=2`, `MAX_RESULTS=8`, `EVIDENCE_ENABLED=true`, `MODEL_ID`, and the
+`MIN_SOURCES=2`, `MAX_RESULTS=10`, `EVIDENCE_ENABLED=true`, `MODEL_ID`, `RESULTS_VERSION`, and the
 names of the four key parameters.
 
 ## Test, build, deploy

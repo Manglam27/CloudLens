@@ -7,7 +7,8 @@ is written to the Checks table, which drives the app's progress screen:
                                                                    (or FAILED)
 
 Pipeline:
-    1 read text    Amazon Textract
+    1 read text    Amazon Textract, on the photo and on a light-text version of it
+                   (for white meme captions); the reading with more words is used
     2 find claim   the LLM (NVIDIA Nemotron) finds the claim, or says it is an
                    opinion, satire or nothing to check; the rules in claim.py are the fallback
     3 evidence     Google Fact Check, Google News, Bing News, Wikipedia, NewsAPI and
@@ -19,13 +20,15 @@ Pipeline:
 
 Configuration (Lambda environment variables):
     CHECKS_TABLE, CACHE_TABLE, SOURCES_TABLE, BUCKET_NAME
-    T_TRUE=70, T_FALSE=30, MIN_SOURCES=2, MAX_RESULTS=8   verdict limits and result budget
+    T_TRUE=70, T_FALSE=30, MIN_SOURCES=2, MAX_RESULTS=10  verdict limits and result budget
     EVIDENCE_ENABLED=true                  turns steps 3 and 4 on
     MODEL_ID                               NVIDIA model, default Nemotron 3 Ultra
     NVIDIA_KEY_PARAM, FACTCHECK_KEY_PARAM, NEWSAPI_KEY_PARAM, GUARDIAN_KEY_PARAM
                                            SSM SecureStrings holding the API keys
 """
 
+import concurrent.futures
+import io
 import os
 import time
 import traceback
@@ -37,11 +40,17 @@ import llm
 from scoring import FALSE, TRUE, score_evidence
 
 MAX_OCR_CHARS = 4000
+RULES_NOTE = "The AI judge was busy, so only fact-check ratings were read; check again in a minute for a full result."
+LIGHT_LEVEL = 200  # gray level (0-255) from which a pixel counts as light text
+MIN_LINE_CONFIDENCE = 80  # Textract confidence (%) for a line to count as read
+MAX_PIXELS = 40_000_000  # larger photos skip the light-text reading
+MAX_TEXTRACT_BYTES = 10 * 1024 * 1024  # Textract's limit for an image sent as bytes
 SOURCES_TTL_SECONDS = 300
 KEY_PARAMS = {"nvidia": "NVIDIA_KEY_PARAM", "google_fact_check": "FACTCHECK_KEY_PARAM",
               "newsapi": "NEWSAPI_KEY_PARAM", "guardian": "GUARDIAN_KEY_PARAM"}
 
 _textract = None
+_s3 = None
 _ssm = None
 _keys = {}
 _sources = None  # (loaded_at, TrustedSources)
@@ -120,23 +129,79 @@ def _trusted_sources():
     return _sources[1]
 
 
+def _s3_client():
+    global _s3
+    if _s3 is None:
+        import boto3
+        _s3 = boto3.client("s3")
+    return _s3
+
+
+def _ocr(document):
+    """Textract's LINE blocks for one image, top to bottom."""
+    blocks = _textract_client().detect_document_text(Document=document).get("Blocks", [])
+    return [b for b in blocks if b.get("BlockType") == "LINE" and b.get("Text")]
+
+
+def light_text_image(data):
+    """The photo as black text on white, keeping only its near-white pixels, as PNG
+    bytes; None if it can't be made. Meme captions are white letters with a black
+    outline over a picture, which Textract reads poorly or not at all; turned into
+    plain dark text they read like a document."""
+    from PIL import Image, ImageOps  # bundled from requirements.txt
+    image = Image.open(io.BytesIO(data))
+    if image.width * image.height > MAX_PIXELS:
+        return None
+    mask = ImageOps.exif_transpose(image).convert("L").point([0 if v >= LIGHT_LEVEL else 255 for v in range(256)])
+    out = io.BytesIO()
+    mask.save(out, "PNG", optimize=True)
+    return out.getvalue() if out.tell() <= MAX_TEXTRACT_BYTES else None
+
+
+def _ocr_light_text(bucket, key):
+    data = _s3_client().get_object(Bucket=bucket, Key=key)["Body"].read()
+    png = light_text_image(data)
+    return _ocr({"Bytes": png}) if png else []
+
+
+def readable_words(lines):
+    """Words on the lines Textract is fairly sure of."""
+    return sum(len(b["Text"].split()) for b in lines if b.get("Confidence", 100) >= MIN_LINE_CONFIDENCE)
+
+
 def read_text(bucket, key):
-    """Step 1: OCR. Returns the text lines Textract found, top to bottom."""
-    result = _textract_client().detect_document_text(Document={"S3Object": {"Bucket": bucket, "Name": key}})
-    return [b["Text"] for b in result.get("Blocks", []) if b.get("BlockType") == "LINE" and b.get("Text")]
+    """Step 1: OCR. Returns the text lines Textract found, top to bottom.
+
+    Two readings run in parallel: the photo as it is, and its light-text version
+    (light_text_image). The one with more confidently read words is used; the
+    photo as it is wins a tie. If the second reading fails, the first is used."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        original = pool.submit(_ocr, {"S3Object": {"Bucket": bucket, "Name": key}})
+        light = pool.submit(_ocr_light_text, bucket, key)
+    lines = original.result()
+    try:
+        alternative = light.result()
+    except Exception:
+        traceback.print_exc()
+        alternative = []
+    if readable_words(alternative) > readable_words(lines):
+        print(f"OCR: light-text reading used ({readable_words(alternative)} words, not {readable_words(lines)})")
+        lines = alternative
+    return [b["Text"] for b in lines]
 
 
 def find_claim(lines):
-    """Step 2. Returns (kind, claim, search_query, used_llm)."""
+    """Step 2. Returns (kind, claim, search_query, topic_query, used_llm)."""
     try:
         found = llm.extract_claim(lines)
         claim = found["claim"].strip() or None
-        return found["kind"], claim, found["search_query"].strip() or (claim or ""), True
+        return (found["kind"], claim, found["search_query"].strip() or (claim or ""), found["topic_query"].strip(),
+                True)
     except llm.LLMError:
         traceback.print_exc()
         claim = rules.find_claim(lines)
         query = rules.search_query(claim) if claim else ""
-        return ("claim" if claim else "no_claim"), claim, query, False
+        return ("claim" if claim else "no_claim"), claim, query, "", False
 
 
 def explain(lines, kind, claim, problem, sources, scored, reason):
@@ -169,7 +234,7 @@ def lambda_handler(event, context):
         print(f"check not found: {key}")
         return
     evidence_enabled = os.environ.get("EVIDENCE_ENABLED", "false").lower() == "true"
-    max_results = int(os.environ.get("MAX_RESULTS", "8"))
+    max_results = int(os.environ.get("MAX_RESULTS", "10"))
     try:
         _update(key, status="READING_TEXT")
         lines = read_text(os.environ["BUCKET_NAME"], item["imageKey"])
@@ -177,7 +242,7 @@ def lambda_handler(event, context):
         llm.set_api_key(keys.get("nvidia"))
 
         _update(key, status="FINDING_CLAIM")
-        kind, claim, query, used_llm = find_claim(lines) if lines else ("no_claim", None, "", True)
+        kind, claim, query, topic, used_llm = find_claim(lines) if lines else ("no_claim", None, "", "", True)
         # A result is cached only if every step it needed ran without a fallback.
         complete = used_llm
 
@@ -188,7 +253,7 @@ def lambda_handler(event, context):
                 problem, complete = "Evidence search is not enabled yet, so this claim cannot be verified.", False
             else:
                 sources, report = evidence.find_evidence(query, keys, _trusted_sources(), max_results,
-                                                         also_try=[claim])
+                                                         also_try=[claim], topic=topic)
                 if report.get(evidence.PRIMARY) != "ok":
                     complete = False  # the main fact-check source was missing or failed
                     if not sources and report.get(evidence.PRIMARY) == "skipped":
@@ -205,11 +270,17 @@ def lambda_handler(event, context):
                 stances, strengths, reason = llm.judge_sources(claim, sources)
             except llm.LLMError:
                 traceback.print_exc()
-                stances = evidence.fallback_stances(sources)
+                # Keyword rules can't tell a story that confirms the claim from one that only
+                # shares its words ("Vaccines do not cause autism"), so without the model they
+                # never back a claim up: only fact-check ratings against it count. The result
+                # is not cached, so checking again later gets the model's judgement.
+                stances = ["RELATED" if st == "SUPPORTS" else st for st in evidence.fallback_stances(sources)]
                 strengths = [evidence.match_strength(s) for s in sources]
                 reason, complete, judged_by = evidence.summarize(sources, stances), False, "rules"
+                reason = (reason + " " if reason else "") + RULES_NOTE
         scored = score_evidence(
-            [{"domain": s["domain"], "weight": s["weight"], "stance": st, "kind": s["kind"], "strength": m}
+            [{"domain": s["domain"], "weight": s["weight"], "stance": st, "kind": s["kind"], "strength": m,
+              "about_media": s.get("about_media", False)}
              for s, st, m in zip(sources, stances, strengths)],
             int(os.environ.get("T_TRUE", "70")), int(os.environ.get("T_FALSE", "30")),
             int(os.environ.get("MIN_SOURCES", "2")))

@@ -8,7 +8,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE / "check_worker"))
-from fakes import FakeTable, FakeTextract  # noqa: E402
+from fakes import FakeS3, FakeTable, FakeTextract  # noqa: E402
 import lambda_function as worker  # noqa: E402  (check_worker/lambda_function.py)
 from claim import clean_lines, find_claim, search_query  # noqa: E402
 from scoring import score_evidence  # noqa: E402
@@ -119,21 +119,21 @@ class ScoringTest(unittest.TestCase):
         scores = [score_evidence([self.check(d, "REFUTES") for d in domains])["score"]
                   for domains in (["snopes.com"], ["snopes.com", "politifact.com"],
                                   ["snopes.com", "politifact.com", "fullfact.org"])]
-        self.assertEqual(scores, [20, 8, 3])
+        self.assertEqual(scores, [16, 5, 2])
 
     def test_two_independent_supporters_make_it_true(self):
         r = score_evidence([self.ev("apnews.com", "SUPPORTS"), self.ev("reuters.com", "SUPPORTS")])
-        self.assertEqual((r["verdict"], r["score"]), ("TRUE", 93))
+        self.assertEqual((r["verdict"], r["score"]), ("TRUE", 96))
 
     def test_a_weak_supporter_pulls_a_false_claim_toward_the_middle(self):
         r = score_evidence([self.ev("snopes.com", "REFUTES"), self.ev("factcheck.org", "REFUTES"),
                             self.ev("bbc.com", "SUPPORTS", 0.6)])
-        self.assertEqual((r["verdict"], r["score"]), ("FALSE", 25))
+        self.assertEqual((r["verdict"], r["score"]), ("FALSE", 24))
 
     def test_one_fact_check_of_the_same_claim_decides(self):
         self.assertEqual(score_evidence([self.check("fullfact.org", "REFUTES")])["verdict"], "FALSE")
         loose = score_evidence([self.check("fullfact.org", "REFUTES", strength=0.4)])
-        self.assertEqual((loose["verdict"], loose["score"]), ("UNVERIFIED", 34))
+        self.assertEqual((loose["verdict"], loose["score"]), ("UNVERIFIED", 31))  # too loose to decide alone
         news = score_evidence([self.ev("cnn.com", "SUPPORTS", 0.6, strength=0.9)])
         self.assertEqual((news["verdict"], news["score"]), ("UNVERIFIED", 69))  # news needs 2 sites
 
@@ -148,10 +148,20 @@ class ScoringTest(unittest.TestCase):
             band = {"TRUE": (70, 100), "FALSE": (0, 30), "UNVERIFIED": (31, 69)}[r["verdict"]]
             self.assertTrue(band[0] <= r["score"] <= band[1], (evidence, r))
 
-    def test_an_encyclopedia_entry_can_confirm_but_not_refute(self):
+    def test_an_encyclopedia_sentence_can_confirm_or_refute(self):
         wiki = self.ev("wikipedia.org", "SUPPORTS", 0.6, kind="reference")
         self.assertEqual(score_evidence([wiki])["verdict"], "TRUE")
-        self.assertEqual(score_evidence([{**wiki, "stance": "REFUTES"}])["verdict"], "UNVERIFIED")
+        self.assertEqual(score_evidence([{**wiki, "stance": "REFUTES"}])["verdict"], "FALSE")  # "Sydney is the capital"
+        vague = {**wiki, "stance": "REFUTES", "strength": 0.5}
+        self.assertEqual(score_evidence([vague])["verdict"], "UNVERIFIED")
+
+    def test_a_fact_check_about_pictures_cannot_set_the_news_aside(self):
+        fake_photos = {**self.check("factcrescendo.com", "REFUTES"), "about_media": True}
+        news = [self.ev(d, "SUPPORTS", 0.6, strength=0.8) for d in ("cbsnews.com", "nytimes.com", "npr.org", "bbc.com", "cnn.com", "pbs.org")]
+        self.assertEqual(score_evidence([fake_photos] + news)["verdict"], "TRUE")
+        self.assertEqual(score_evidence([fake_photos])["verdict"], "UNVERIFIED")  # nor decide alone
+        real_check = self.check("leadstories.com", "REFUTES")  # "Senate did NOT just confirm..."
+        self.assertEqual(score_evidence([real_check] + news)["verdict"], "FALSE")
 
     def test_one_site_counts_once(self):
         one = score_evidence([self.ev("snopes.com", "REFUTES")])
@@ -193,6 +203,7 @@ class WorkerTest(unittest.TestCase):
         self.checks.put_item({"userId": USER, "checkId": CHECK, "imageKey": f"{USER}_a.jpg", "imageHash": "h",
                               "status": "QUEUED"})
         worker._tables = {"checks": self.checks, "cache": self.cache}
+        worker._s3 = FakeS3({f"{USER}_a.jpg": b"not an image"})  # the light-text reading fails and is skipped
         worker._keys = {}  # no LLM key here: these tests cover the rule-based fallback
         worker.llm.set_api_key(None)
 
@@ -233,6 +244,55 @@ class WorkerTest(unittest.TestCase):
         item = self.run_with(FakeTextract(fail=True))
         self.assertEqual(item["status"], "FAILED")
         self.assertIn("error", item)
+
+
+class LightTextOcrTest(unittest.TestCase):
+    """The second OCR reading, for white meme captions."""
+
+    def setUp(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is not installed")
+        import io
+        image = Image.new("RGB", (40, 20), (90, 120, 60))  # a green "photo" with a white caption
+        image.paste((255, 255, 255), (5, 5, 35, 15))
+        out = io.BytesIO()
+        image.save(out, "JPEG")
+        worker._s3 = FakeS3({"meme.jpg": out.getvalue()})
+
+    def read_with(self, original, light):
+        class Textract:
+            calls = []
+
+            def detect_document_text(self, Document):
+                self.calls.append(Document)
+                lines = light if "Bytes" in Document else original
+                return {"Blocks": [{"BlockType": "LINE", "Text": t, "Confidence": c} for t, c in lines]}
+        worker._textract = Textract()
+        return worker.read_text("bucket", "meme.jpg")
+
+    def test_light_pixels_become_dark_text_on_white(self):
+        from PIL import Image
+        import io
+        png = worker.light_text_image(worker._s3.objects["meme.jpg"])
+        image = Image.open(io.BytesIO(png))
+        self.assertLess(image.getpixel((20, 10)), 50)    # the caption is now dark
+        self.assertGreater(image.getpixel((1, 1)), 200)  # the picture is now white
+
+    def test_reading_with_more_words_is_used(self):
+        lines = self.read_with(original=[("OF AUSTRALIA", 97)],
+                               light=[("SYDNEY IS THE CAPITAL CITY", 99), ("OF AUSTRALIA", 99)])
+        self.assertEqual(lines, ["SYDNEY IS THE CAPITAL CITY", "OF AUSTRALIA"])
+
+    def test_unsure_lines_do_not_count(self):
+        lines = self.read_with(original=[("Water boils at 100 C", 95)],
+                               light=[("W4t3r b0ils a7 1OO C at sea", 40)])
+        self.assertEqual(lines, ["Water boils at 100 C"])
+
+    def test_the_photo_as_it_is_wins_a_tie(self):
+        lines = self.read_with(original=[("Daily Truth Feed", 96)], light=[("Daily Tuth Feed", 96)])
+        self.assertEqual(lines, ["Daily Truth Feed"])
 
 
 if __name__ == "__main__":

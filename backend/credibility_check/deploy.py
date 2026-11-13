@@ -32,7 +32,7 @@ CHECKS_TABLE = "CloudLensChecks"
 CACHE_TABLE = "CloudLensResultCache"
 # Saved results are reused only if made by this version of the checker. Raise it
 # whenever the claim, judging or scoring logic changes, so old results are re-run.
-RESULTS_VERSION = "2"
+RESULTS_VERSION = "5"
 SOURCES_TABLE = "CloudLensTrustedSources"
 API_FN, WORKER_FN = "cloudlens-check-api", "cloudlens-check-worker"
 AUTHORIZER = "cloudlens-cognito"
@@ -214,7 +214,7 @@ def main():
               "RESULTS_VERSION": RESULTS_VERSION}
     ensure_function(WORKER_FN, worker_role, HERE / "dist" / "check_worker.zip",
                     {**common, "SOURCES_TABLE": SOURCES_TABLE, "T_TRUE": "70", "T_FALSE": "30", "MIN_SOURCES": "2",
-                     "MAX_RESULTS": "8", "EVIDENCE_ENABLED": "true", "MODEL_ID": MODEL_ID, **KEY_PARAMS},
+                     "MAX_RESULTS": "10", "EVIDENCE_ENABLED": "true", "MODEL_ID": MODEL_ID, **KEY_PARAMS},
                     timeout=120, memory=512)  # two LLM calls of up to 50 s each
     ensure_function(API_FN, api_role, HERE / "dist" / "check_api.zip",
                     {**common, "WORKER_FUNCTION": WORKER_FN}, timeout=10, memory=256)
