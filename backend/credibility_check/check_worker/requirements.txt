@@ -1,0 +1,1 @@
+Pillow==12.0.0  # second OCR pass on light-text images (meme captions)

@@ -54,18 +54,26 @@ with no social-media integration.
 1. **Request:** the user taps **Check** on a cloud photo, or **Upload and Check**
    on a local one. The server saves a job and returns at once; the app polls every
    2 seconds and shows the current step.
-2. **Read text:** Amazon Textract extracts the text lines from the screenshot.
+2. **Read text:** Amazon Textract extracts the text lines from the screenshot,
+   reading it a second time as dark-on-white text so white meme captions are
+   read too.
 3. **Find the claim:** an LLM, NVIDIA Nemotron 3 Ultra, keeps the checkable
-   statement, or returns none for opinions and jokes. Rules that remove names,
-   @handles, times and like counts are the fallback.
+   statement, or returns none for opinions and jokes. All checks share NVIDIA's
+   rate limit through a DynamoDB counter; when Nemotron is busy, Gemma 4 31B
+   and then Nemotron 3.5 Lightning answer instead, and identical requests are
+   answered from a cache. Rules that remove names, @handles, times and like
+   counts are the last resort.
 4. **Find evidence:** Google Fact Check Tools, Google News, Bing News,
    Wikipedia, NewsAPI and The Guardian are searched in parallel. Only sites in
    the trusted-source table (fact-checkers, wire services, news outlets and
-   Wikipedia, 109 in all) count, at most 8 results.
-5. **Judge the sources:** the LLM labels each source Supports, Refutes, Mixed or
-   Unrelated, rates how directly it settles the claim (its strength, 0 to 1) and
-   writes a short reason. Rules that read fact-check ratings, headlines and
-   keyword matches are the fallback.
+   Wikipedia, 109 in all) count, at most 10 results, of which fact-checks fill at
+   most half so news reporting the event is always judged too.
+5. **Judge the sources:** the LLM answers, for each source, whether it shows
+   the claim true, false, partly true or does not address it, rates how
+   directly it settles the claim (its strength, 0 to 1) and writes a short
+   reason. A fact-check older than later news confirming the claim is set aside
+   as outdated. Rules that read fact-check ratings are the last resort, and
+   they never call a claim true.
 6. **Score:** the formula below gives the score and verdict, which are saved for
    history.
 
@@ -78,13 +86,16 @@ with no social-media integration.
   settles this exact claim, from 0 to 1.
 - **Vote** = weight × strength; a site counts once. **S** adds up the votes for
   the claim and **R** the votes against (a "Half True" rating gives half to each).
-- **Direction** D = (S − R) ÷ (S + R) and **certainty** C = 1 − e^(−(S + R)).
+- **Direction** D = (S − R) ÷ (S + R) and **certainty** C = 1 − e^(−(S + R) ÷ 0.8).
 - **Score = 50 + 50 × D × C.** 50 means no evidence or an even split; more and
   stronger evidence on one side moves the score further from 50. One strong
-  fact-check rating a claim false gives about 20, two give 8, three give 3.
+  fact-check rating a claim false gives about 16, two give 5, three give 2.
+- When a trusted fact-check addresses the exact claim, only fact-checks vote:
+  it has already weighed the news, which may be an old event presented as new.
 - **True:** score ≥ 70; **False:** score ≤ 30; **Unverified:** in between. True
   or False also needs 2 independent trusted sources on that side, or one
-  published fact-check (or, for True, a Wikipedia sentence) of this claim;
+  published fact-check of this claim (or a Wikipedia sentence stating or
+  contradicting it);
   otherwise the score is held at 69 or 31.
 
 The backend README has the full rules and worked examples.
@@ -160,7 +171,7 @@ never leave AWS.
 | Android minSdk / compileSdk | 24 / `flutter.compileSdkVersion` |
 | Android Gradle Plugin | 8.13.0 |
 | Kotlin Gradle Plugin | 2.2.20 |
-| iOS deployment target | 13.0 (required by `amplify_auth_cognito`) |
+| iOS deployment target | 15.0 (Flutter's current minimum; Amplify needs at least 13.0) |
 | Backend | Python 3.13 on AWS Lambda |
 
 ## Setup
@@ -181,6 +192,19 @@ never leave AWS.
    ```
    flutter run
    ```
+
+   **On an iPhone** (needs a Mac with Xcode, CocoaPods and Flutter installed):
+
+   ```
+   cd ios && pod install && cd ..
+   open ios/Runner.xcworkspace
+   ```
+
+   In Xcode, under Runner → Signing & Capabilities, sign in with an Apple ID and
+   pick it as the Team; change the bundle identifier if Xcode says it is taken.
+   Then install with `flutter run --release`, and on the phone trust the
+   developer under Settings → General → VPN & Device Management. With a free
+   Apple ID the app has to be reinstalled every 7 days.
 
 4. Backend: each Lambda has its own README with test, build and deploy steps,
    in `backend/photo_edits/` and `backend/credibility_check/`. The credibility

@@ -11,7 +11,7 @@ class SignupPage extends StatefulWidget {
   const SignupPage({super.key, required this.signOutCallback});
 
   @override
-  _SignupPageState createState() => _SignupPageState();
+  State<SignupPage> createState() => _SignupPageState();
 }
 
 class _SignupPageState extends State<SignupPage> {
@@ -146,7 +146,7 @@ class _SignupPageState extends State<SignupPage> {
                       borderRadius: BorderRadius.circular(30.0),
                       boxShadow: [
                         BoxShadow(
-                          color: Colors.black.withOpacity(0.1),
+                          color: Colors.black.withValues(alpha: 0.1),
                           spreadRadius: 2,
                           blurRadius: 5,
                           offset: const Offset(0, 2),
@@ -171,7 +171,7 @@ class _SignupPageState extends State<SignupPage> {
                       borderRadius: BorderRadius.circular(30.0),
                       boxShadow: [
                         BoxShadow(
-                          color: Colors.black.withOpacity(0.1),
+                          color: Colors.black.withValues(alpha: 0.1),
                           spreadRadius: 2,
                           blurRadius: 5,
                           offset: const Offset(0, 2),

@@ -29,12 +29,15 @@ class _CameraPageState extends State<CameraPage> {
       _controller = CameraController(
         camera,
         ResolutionPreset.medium,
+        enableAudio: false, // photos only, so no microphone prompt
       );
       _initControllerFuture = _controller.initialize();
       await _initControllerFuture;
+      if (!mounted) return;
       setState(() {});
     } catch (e) {
-      print('initialization failed: $e');
+      debugPrint('initialization failed: $e');
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('initialization failed: $e')),
       );
@@ -48,9 +51,11 @@ class _CameraPageState extends State<CameraPage> {
   }
 
   void onCameraPressed() async {
+    // Taken before the awaits below, while the context is certainly still valid.
+    final messenger = ScaffoldMessenger.of(context);
     try {
       if (!_controller.value.isInitialized) {
-        ScaffoldMessenger.of(context).showSnackBar(
+        messenger.showSnackBar(
           SnackBar(content: Text('Camera not initialized')),
         );
         return;
@@ -66,16 +71,16 @@ class _CameraPageState extends State<CameraPage> {
       );
 
       if (result['isSuccess'] == true || result['isSuccess'] == 1) {
-        ScaffoldMessenger.of(context).showSnackBar(
+        messenger.showSnackBar(
           SnackBar(content: Text('Saved to gallery!')),
         );
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(
+        messenger.showSnackBar(
           SnackBar(content: Text('Failed to save photo')),
         );
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
+      messenger.showSnackBar(
         SnackBar(content: Text('Error: $e')),
       );
     }

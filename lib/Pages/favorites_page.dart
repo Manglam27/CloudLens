@@ -34,6 +34,7 @@ class _FavoritesPageState extends State<FavoritesPage> {
   }
 
   Future<void> downloadImage(String url) async {
+    final messenger = ScaffoldMessenger.of(context);
     try {
       final response = await http.get(Uri.parse(url));
       final Uint8List bytes = response.bodyBytes;
@@ -43,16 +44,16 @@ class _FavoritesPageState extends State<FavoritesPage> {
         quality: 100,
       );
       if ((result['isSuccess'] ?? false) == true) {
-        ScaffoldMessenger.of(context).showSnackBar(
+        messenger.showSnackBar(
           const SnackBar(content: Text("✅ Successfully saved to gallery")),
         );
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(
+        messenger.showSnackBar(
           const SnackBar(content: Text("❌ Failed to save image")),
         );
       }
     } catch (e) {
-      print("Download error: $e");
+      debugPrint("Download error: $e");
     }
   }
 

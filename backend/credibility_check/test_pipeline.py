@@ -11,11 +11,15 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE / "check_worker"))
-from fakes import ClientError, FakeTable, FakeTextract  # noqa: E402
+from fakes import ClientError, FakeS3, FakeTable, FakeTextract  # noqa: E402
 import claim as claim_rules  # noqa: E402
 import evidence  # noqa: E402
 import lambda_function as worker  # noqa: E402
+import gate as gate_module  # noqa: E402
 import llm  # noqa: E402
+
+llm.RETRY_DELAY_SECONDS = 0  # retries happen at once in tests
+llm.BUSY_WAITS = (0, 0, 0)
 
 USER, CHECK = "44b8a418-d021-70bf-86aa-875bc10aeb8c", "1790380000000-abcdef12"
 LINES = ["Jane Doe", "@janedoe . 2h", "BREAKING: Drinking two cups of coffee a day cures the flu, doctors say."]
@@ -45,7 +49,7 @@ class FakeLLM:
         self.claim_finish, self.judge_finish, self.wrap = claim_finish, judge_finish, wrap
         self.calls = []
 
-    def __call__(self, body):
+    def __call__(self, body, timeout=None):
         self.calls.append(body)
         assert body["temperature"] == 0 and body["chat_template_kwargs"] == {"enable_thinking": False}
         system, user = body["messages"][0]["content"], body["messages"][1]["content"]
@@ -59,6 +63,66 @@ class FakeLLM:
 
     def _reply(self, payload, finish):
         return {"choices": [{"message": {"content": self.wrap(json.dumps(payload))}, "finish_reason": finish}]}
+
+
+class GateTable:
+    """Stands in for the CloudLensLLM table: slot counters with a condition, and stored answers."""
+
+    def __init__(self):
+        self.items = {}
+
+    def get_item(self, Key):
+        item = self.items.get(Key["key"])
+        return {"Item": dict(item)} if item else {}
+
+    def put_item(self, Item):
+        self.items[Item["key"]] = dict(Item)
+
+    def update_item(self, Key, UpdateExpression, ConditionExpression, ExpressionAttributeValues):
+        item = self.items.setdefault(Key["key"], {"key": Key["key"]})
+        if item.get("calls", 0) >= ExpressionAttributeValues[":limit"]:
+            raise ClientError("ConditionalCheckFailedException")
+        item["calls"] = item.get("calls", 0) + 1
+
+
+class GateTest(unittest.TestCase):
+    def setUp(self):
+        self.now, self.slept = 1000.0, []
+
+    def gate(self, table, rpm=26):
+        def sleep(seconds):
+            self.slept.append(seconds)
+            self.now += seconds
+        return gate_module.Gate(table, rpm=rpm, clock=lambda: self.now, sleep=sleep)
+
+    def test_at_most_four_calls_in_ten_seconds_then_wait_for_the_next_window(self):
+        g = self.gate(GateTable())
+        self.assertTrue(all(g.acquire(deadline=2000) for _ in range(4)))
+        self.assertEqual(self.slept, [])
+        self.assertTrue(g.acquire(deadline=2000))  # the 5th waits for the next window
+        self.assertAlmostEqual(self.slept[0], 10.05)
+
+    def test_gives_up_when_no_slot_frees_before_the_deadline(self):
+        g = self.gate(GateTable())
+        for _ in range(4):
+            g.acquire(deadline=2000)
+        self.assertFalse(g.acquire(deadline=self.now + 2))
+        self.assertEqual(self.slept, [])
+
+    def test_a_broken_counter_never_blocks_a_check(self):
+        class Broken(GateTable):
+            def update_item(self, **kwargs):
+                raise ClientError("ProvisionedThroughputExceededException")
+        self.assertTrue(self.gate(Broken()).acquire(deadline=0))
+
+    def test_answers_are_stored_and_expire(self):
+        table = GateTable()
+        g = self.gate(table)
+        key = g.key("model", "system", "user", 512)
+        self.assertIsNone(g.cached(key))
+        g.remember(key, {"kind": "claim", "strength": 0.9})
+        self.assertEqual(g.cached(key), {"kind": "claim", "strength": 0.9})
+        self.assertEqual(table.items[key]["expiresAt"], 1000 + 30 * 86400)
 
 
 class FakeSSM:
@@ -83,7 +147,7 @@ class FakeWeb:
             if host in url:
                 if isinstance(data, Exception):
                     raise data
-                return data
+                return data(url) if callable(data) else data
         raise evidence.EvidenceError("HTTP 429")
 
 
@@ -92,6 +156,61 @@ class EvidenceTest(unittest.TestCase):
         self.web = FakeWeb()
         self._original = evidence._http_get_json, evidence._http_get_xml
         evidence._http_get_json = evidence._http_get_xml = self.web
+
+    def test_topic_query_finds_fact_checks_of_the_same_story(self):
+        hoax = review("politifact.com", "False", claimed="Video proves the moon landing was a hoax.",
+                      title="No, the moon landing was not faked")
+        self.web.responses = {"factchecktools": lambda url: {"claims": [hoax]} if "hoax" in url else {}}
+        items, _ = evidence.find_evidence("1969 Moon landing filmed Hollywood studio NASA insider confirmed",
+                                          {"google_fact_check": "G"}, seed_sources(), 8, enabled=[evidence.PRIMARY],
+                                          also_try=["The 1969 Moon landing was filmed in a Hollywood studio."],
+                                          topic="moon landing hoax")
+        self.assertEqual([i["domain"] for i in items], ["politifact.com"])
+
+    def test_an_older_hoax_fact_check_is_outdated_by_later_news(self):
+        def item(kind, domain, date):
+            return {"kind": kind, "domain": domain, "date": date}
+        # "Another hoax claims Queen Elizabeth II is dead" (2021), then her death reported in 2022
+        items = [item("fact_check", "politifact.com", "2021-10-21"), item("news", "bbc.com", "2022-09-08"),
+                 item("news", "reuters.com", "2022-09-08")]
+        self.assertEqual(evidence.outdated_fact_checks(items, ["REFUTES", "SUPPORTS", "SUPPORTS"], [0.8, 1, 1]), {0})
+        # One later report is not enough, and weak support does not count
+        self.assertEqual(evidence.outdated_fact_checks(items[:2], ["REFUTES", "SUPPORTS"], [0.8, 1]), set())
+        self.assertEqual(evidence.outdated_fact_checks(items, ["REFUTES", "SUPPORTS", "SUPPORTS"], [0.8, 0.5, 0.5]),
+                         set())
+        # "Senate did NOT just confirm..." (2025) about a 2021 confirmation: the fact-check is newer
+        sams = [item("fact_check", "leadstories.com", "2025-02-03"), item("news", "nbcnews.com", "2021-11-18"),
+                item("news", "pbs.org", "2021-11-19")]
+        self.assertEqual(evidence.outdated_fact_checks(sams, ["REFUTES", "SUPPORTS", "SUPPORTS"], [0.8, 1, 1]), set())
+
+    def test_dates_are_read_from_feeds_and_fact_checks(self):
+        self.assertEqual(evidence._day("Thu, 08 Sep 2022 17:30:00 GMT"), "2022-09-08")
+        self.assertEqual(evidence._day("2021-10-21T00:00:00Z"), "2021-10-21")
+        self.assertEqual(evidence._day("not a date"), "")
+
+    def test_fact_checks_about_pictures_of_an_event_are_marked(self):
+        claim = "Artemis II astronauts splash down off San Diego."
+        self.web.responses = {"factchecktools": {"claims": [
+            review("snopes.com", "Misleading", claimed="Viral images show the Artemis II crew splashing down.",
+                   title="Artemis II splashdown images are AI-generated"),
+            review("politifact.com", "False", url="https://politifact.com/b", title="Artemis II did not splash down",
+                   claimed="Artemis II astronauts did not splash down off San Diego.")]}}
+        items, _ = evidence.find_evidence("Artemis II astronauts splash down San Diego", {"google_fact_check": "G"},
+                                          seed_sources(), 8, enabled=[evidence.PRIMARY], also_try=[claim])
+        self.assertEqual({i["domain"]: i["about_media"] for i in items}, {"snopes.com": True, "politifact.com": False})
+
+    def test_fact_checks_leave_places_for_news(self):
+        self.web.responses = {
+            "factchecktools": {"claims": [review(site, "False", claimed=f"Trump won the 2024 election {site}")
+                                          for site in ("snopes.com", "politifact.com", "factcheck.org", "reuters.com",
+                                                       "apnews.com", "fullfact.org", "leadstories.com")]},
+            "newsapi.org": {"status": "ok", "articles": [
+                {"source": {"name": n}, "url": f"https://www.{d}/trump-wins", "title": "Trump won the 2024 election",
+                 "description": ""} for n, d in (("BBC", "bbc.com"), ("NPR", "npr.org"), ("CNN", "cnn.com"))]},
+        }
+        items, _ = evidence.find_evidence("Trump won 2024 election", {"google_fact_check": "G", "newsapi": "N"},
+                                          seed_sources(), 8, enabled=[evidence.PRIMARY, "newsapi"])
+        self.assertEqual([i["kind"] for i in items], ["fact_check"] * 4 + ["news"] * 3 + ["fact_check"])
 
     def tearDown(self):
         evidence._http_get_json, evidence._http_get_xml = self._original
@@ -152,6 +271,26 @@ class EvidenceTest(unittest.TestCase):
         finally:
             evidence.urllib.request.urlopen = original_urlopen
         self.assertNotIn("SECRET-KEY-123", str(ctx.exception))
+
+    def test_busy_provider_is_retried(self):
+        import io
+        import urllib.error
+        evidence._http_get_json, evidence._http_get_xml = self._original
+        original = evidence.urllib.request.urlopen, evidence.RETRY_DELAYS
+        calls = []
+
+        def busy_once(request, timeout):
+            calls.append(1)
+            if len(calls) == 1:
+                raise urllib.error.HTTPError(request.full_url, 429, "Too Many Requests", {}, None)
+            return io.BytesIO(b'{"ok": true}')
+
+        evidence.urllib.request.urlopen, evidence.RETRY_DELAYS = busy_once, (0, 0)
+        try:
+            self.assertEqual(evidence._http_get_json("https://example.org"), {"ok": True})
+        finally:
+            evidence.urllib.request.urlopen, evidence.RETRY_DELAYS = original
+        self.assertEqual(len(calls), 2)
 
     def test_rating_rules(self):
         cases = {"False": "REFUTES", "Pants on Fire!": "REFUTES", "Mostly False": "REFUTES", "Incorrect": "REFUTES",
@@ -366,6 +505,155 @@ class JudgeTest(unittest.TestCase):
         with self.assertRaises(llm.LLMError):
             llm.extract_claim(LINES)
 
+    def test_unusable_reply_is_asked_again_once(self):
+        replies = iter([""])  # an empty reply first, then a good one
+        fake = llm._post = FakeLLM(wrap=lambda text: next(replies, text))
+        self.assertEqual(llm.extract_claim(LINES)["claim"], CLAIM)
+        self.assertEqual(len(fake.calls), 2)
+
+    def test_busy_api_is_tried_again_a_few_times(self):
+        calls = []
+
+        def busy(body, timeout=None):
+            calls.append(body)
+            raise llm.LLMRateLimited("NVIDIA API returned HTTP 429")
+        llm._post = busy
+        with self.assertRaises(llm.LLMBusy):
+            llm.extract_claim(LINES)
+        self.assertEqual(len(calls), 1 + len(llm.BUSY_WAITS))
+
+    def test_busy_api_is_not_tried_again_after_the_deadline(self):
+        import time
+        calls = []
+
+        def busy(body, timeout=None):
+            calls.append(body)
+            raise llm.LLMRateLimited("NVIDIA API returned HTTP 429")
+        llm._post, original = busy, llm.BUSY_WAITS
+        llm.BUSY_WAITS = (5,)
+        llm.set_deadline(time.time() + 1)
+        try:
+            with self.assertRaises(llm.LLMBusy):
+                llm.extract_claim(LINES)
+        finally:
+            llm.set_deadline(None)
+            llm.BUSY_WAITS = original
+        self.assertEqual(len(calls), 1)
+
+    def test_identical_requests_reuse_the_stored_answer(self):
+        table = GateTable()
+        llm.gates = {llm.DEFAULT_MODEL: gate_module.Gate(table)}
+        try:
+            fake = llm._post = FakeLLM()
+            first = llm.extract_claim(LINES)
+            second = llm.extract_claim(LINES)
+        finally:
+            llm.gates = {}
+        self.assertEqual(first, second)
+        self.assertEqual(len(fake.calls), 1)
+
+    def chain(self, post):
+        """Runs extract_claim with a main and a fallback model, both gated by one table."""
+        os.environ["FALLBACK_MODEL_ID"] = "small-model"
+        self.table = GateTable()
+        llm.gates = {llm.DEFAULT_MODEL: gate_module.Gate(self.table, name="main"),
+                     "small-model": gate_module.Gate(self.table, name="small")}
+        llm._post = post
+        try:
+            return llm.extract_claim(LINES)
+        finally:
+            del os.environ["FALLBACK_MODEL_ID"]
+            llm.gates = {}
+
+    def test_a_rate_limited_main_model_hands_over_to_the_fallback_and_cools_down(self):
+        good, used = FakeLLM(), []
+
+        def post(body, timeout=None):
+            used.append(body["model"])
+            if body["model"] == llm.DEFAULT_MODEL:
+                raise llm.LLMRateLimited("NVIDIA API returned HTTP 429")
+            return good(body)
+        self.assertEqual(self.chain(post)["claim"], CLAIM)
+        self.assertEqual(used, [llm.DEFAULT_MODEL, "small-model"])  # no retries on the main model
+        self.assertEqual(llm.last_model, "small-model")
+        self.assertIn("cool#main", self.table.items)
+        # the last-resort model's answer is not stored for the next check
+        self.assertFalse([k for k in self.table.items if k.startswith("answer#")])
+
+    def test_a_cooling_main_model_is_skipped(self):
+        good, used = FakeLLM(), []
+
+        def post(body, timeout=None):
+            used.append(body["model"])
+            return good(body)
+        import time
+        os.environ["FALLBACK_MODEL_ID"] = "small-model"
+        table = GateTable()
+        main = gate_module.Gate(table, name="main")
+        main.cool_down(60)
+        llm.gates = {llm.DEFAULT_MODEL: main, "small-model": gate_module.Gate(table, name="small")}
+        llm._post = post
+        try:
+            llm.extract_claim(LINES)
+        finally:
+            del os.environ["FALLBACK_MODEL_ID"]
+            llm.gates = {}
+        self.assertEqual(used, ["small-model"])
+        self.assertGreater(int(table.items["cool#main"]["until"]), time.time())
+
+    def test_a_backup_model_that_hangs_is_skipped_for_a_while(self):
+        good, used = FakeLLM(), []
+
+        def post(body, timeout=None):
+            used.append((body["model"], timeout))
+            if body["model"] != "small-model":
+                raise llm.LLMTimeout("NVIDIA API request timed out")
+            return good(body)
+        os.environ["FALLBACK_MODEL_ID"] = "gemma,small-model"
+        table = GateTable()
+        llm.gates = {m: gate_module.Gate(table, name=n) for m, n in
+                     ((llm.DEFAULT_MODEL, "main"), ("gemma", "gemma"), ("small-model", "small"))}
+        llm._post = post
+        try:
+            self.assertEqual(llm.extract_claim(LINES)["claim"], CLAIM)
+        finally:
+            del os.environ["FALLBACK_MODEL_ID"]
+            llm.gates = {}
+        self.assertEqual(used, [(llm.DEFAULT_MODEL, llm.TIMEOUT_SECONDS), ("gemma", llm.FALLBACK_TIMEOUT_SECONDS),
+                                ("small-model", llm.FALLBACK_TIMEOUT_SECONDS)])
+        self.assertIn("cool#gemma", table.items)      # a hanging backup is skipped for a while
+        self.assertNotIn("cool#main", table.items)    # the main model is not, one slow answer is no pattern
+
+    def test_several_fallback_models_are_tried_in_order(self):
+        os.environ["FALLBACK_MODEL_ID"] = "gemma, small-model,gemma"
+        try:
+            self.assertEqual(llm.models(), [llm.DEFAULT_MODEL, "gemma", "small-model"])
+        finally:
+            del os.environ["FALLBACK_MODEL_ID"]
+
+    def test_the_main_model_is_used_when_it_answers(self):
+        fake = FakeLLM()
+        self.chain(fake)
+        self.assertEqual([c["model"] for c in fake.calls], [llm.DEFAULT_MODEL])
+        self.assertEqual(llm.last_model, llm.DEFAULT_MODEL)
+
+    def test_judge_sees_publication_dates(self):
+        fake = llm._post = FakeLLM()
+        llm.judge_sources(CLAIM, [{"kind": "news", "publisher": "BBC", "domain": "bbc.com", "title": "t",
+                                   "summary": "", "date": "2022-09-08"}])
+        self.assertIn("News article from BBC (bbc.com), published 2022-09-08", fake.calls[0]["messages"][1]["content"])
+
+    def test_timeout_is_not_retried(self):
+        calls = []
+
+        def slow(body, timeout=None):
+            calls.append(body)
+            raise llm.LLMTimeout("NVIDIA API request timed out")
+        llm._post = slow
+        with self.assertRaises(llm.LLMTimeout):
+            llm.extract_claim(LINES)
+        self.assertEqual(len(calls), 1)
+
     def test_json_is_found_inside_thinking_and_code_fences(self):
         llm._post = FakeLLM(wrap=lambda text: f"<think>Let me see.</think>```json\n{text}\n```")
         self.assertEqual(llm.extract_claim(LINES)["claim"], CLAIM)
@@ -394,6 +682,7 @@ class PipelineTest(unittest.TestCase):
                               "status": "QUEUED"})
         worker._tables = {"checks": self.checks, "cache": self.cache, "sources": self.sources}
         worker._textract = FakeTextract(LINES)
+        worker._s3 = FakeS3({f"{USER}_a.jpg": b"not an image"})  # the light-text reading fails and is skipped
         worker._ssm, worker._keys, worker._sources = FakeSSM({GOOGLE_PARAM: "GKEY", NVIDIA_PARAM: "NVKEY"}), {}, None
         self._post = llm._post
         self.web = FakeWeb()
@@ -415,9 +704,9 @@ class PipelineTest(unittest.TestCase):
     def test_two_refuting_fact_checkers_give_false(self):
         fake = FakeLLM()
         item = self.run_check(fake)
-        self.assertEqual((item["status"], item["verdict"], item["score"]), ("DONE", "FALSE", 8))
+        self.assertEqual((item["status"], item["verdict"], item["score"]), ("DONE", "FALSE", 5))
         # What went into the score is kept with the result.
-        self.assertEqual((item["judgedBy"], item["certainty"]), (llm.DEFAULT_MODEL, 83))
+        self.assertEqual((item["judgedBy"], item["certainty"]), (llm.DEFAULT_MODEL, 89))
         self.assertEqual([(x["weight"], x["strength"]) for x in item["sources"]], [(100, 90), (100, 90)])
         self.assertEqual(item["claim"], CLAIM)
         self.assertEqual(item["reason"], "Two fact-checkers rated this claim false.")
@@ -430,12 +719,12 @@ class PipelineTest(unittest.TestCase):
         self.web.responses = {"factchecktools": {"claims": [review("apnews.com", "True"),
                                                             review("reuters.com", "Correct")]}}
         item = self.run_check(FakeLLM(stances=["SUPPORTS", "SUPPORTS"], reason="Two sources confirm it."))
-        self.assertEqual((item["verdict"], item["score"]), ("TRUE", 92))
+        self.assertEqual((item["verdict"], item["score"]), ("TRUE", 95))
 
     def test_one_fact_check_of_the_same_claim_is_enough(self):
         self.web.responses = {"factchecktools": {"claims": [review("snopes.com", "False")]}}
         item = self.run_check(FakeLLM())
-        self.assertEqual((item["verdict"], item["score"]), ("FALSE", 20))
+        self.assertEqual((item["verdict"], item["score"]), ("FALSE", 16))
 
     def test_one_loosely_matching_fact_check_is_not_enough(self):
         self.web.responses = {"factchecktools": {"claims": [
@@ -446,9 +735,9 @@ class PipelineTest(unittest.TestCase):
 
     def test_without_the_llm_ratings_still_give_a_verdict(self):
         item = self.run_check(FakeLLM(claim_finish="length", judge_finish="length"))
-        self.assertEqual((item["verdict"], item["score"]), ("FALSE", 7))
+        self.assertEqual((item["verdict"], item["score"]), ("FALSE", 4))
         self.assertIn("coffee", item["claim"])  # found by the rules
-        self.assertEqual(item["reason"], "2 trusted fact-checks rated this claim false or misleading.")
+        self.assertEqual(item["reason"], "2 trusted fact-checks rated this claim false or misleading. " + worker.RULES_NOTE)
         self.assertEqual(self.cache.items, {})  # fallbacks are never cached
 
     def test_opinions_are_not_searched(self):
@@ -499,7 +788,7 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual((item["verdict"], item["score"], item["sources"]), ("UNVERIFIED", 50, []))
         self.assertIn("were found yet", item["reason"])
 
-    def test_without_the_llm_matching_news_counts_and_off_topic_is_hidden(self):
+    def test_without_the_llm_matching_news_never_backs_a_claim_up(self):
         worker._ssm = FakeSSM({GOOGLE_PARAM: "GKEY", NEWSAPI_PARAM: "NKEY"})
         self.web.responses = {"factchecktools": {}, "newsapi.org": {"status": "ok", "articles": [
             {"source": {"name": "AP"}, "url": "https://apnews.com/a",
@@ -508,14 +797,24 @@ class PipelineTest(unittest.TestCase):
              "title": "Drinking two cups of coffee cures flu, doctors report", "description": "A new study."},
             {"source": {"name": "BBC"}, "url": "https://www.bbc.com/c", "title": "Flu season starts early"}]}}
         item = self.run_check(FakeLLM(claim_finish="length", judge_finish="length"))
-        self.assertEqual([s["stance"] for s in item["sources"]], ["SUPPORTS", "SUPPORTS"])
-        self.assertEqual((item["verdict"], item["score"]), ("TRUE", 91))
-        self.assertEqual(item["reason"], "2 trusted sources back up this claim.")
+        # Shared keywords are not support ("Vaccines do not cause autism"), so the rules
+        # show matching news as related and leave the claim unverified; off-topic news is hidden.
+        self.assertEqual([s["stance"] for s in item["sources"]], ["RELATED", "RELATED"])
+        self.assertEqual((item["verdict"], item["score"]), ("UNVERIFIED", 50))
+        self.assertTrue(item["reason"].endswith(worker.RULES_NOTE))
+        self.assertEqual(self.cache.items, {})
 
     def test_stages_still_run_in_order(self):
         self.run_check(FakeLLM())
         stages = [h["status"] for h in self.checks.history]
         self.assertEqual(stages, ["READING_TEXT", "FINDING_CLAIM", "SEARCHING_SOURCES", "SCORING", "DONE"])
+
+    def test_timings_queries_and_every_judged_source_are_recorded(self):
+        item = self.run_check(FakeLLM())
+        self.assertEqual(set(item["timings"]), {"ocrMs", "claimMs", "searchMs", "judgeMs", "llmWaitMs", "totalMs"})
+        self.assertEqual(item["searchQuery"], "coffee cures flu")
+        self.assertEqual({j["domain"] for j in item["judged"]}, {"snopes.com", "politifact.com"})
+        self.assertNotIn("timings", next(iter(self.cache.items.values())))  # not part of the shared result
 
 
 if __name__ == "__main__":

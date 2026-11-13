@@ -1,7 +1,11 @@
 import 'dart:io';
+import 'dart:math';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:photo_manager/photo_manager.dart';
 import 'package:amplify_flutter/amplify_flutter.dart';
 import 'package:uuid/uuid.dart';
 import 'package:cloud_lens/Pages/check_page.dart';
@@ -21,7 +25,7 @@ class PhotosPage extends StatefulWidget {
   const PhotosPage({super.key});
 
   @override
-  _PhotosPageState createState() => _PhotosPageState();
+  State<PhotosPage> createState() => _PhotosPageState();
 }
 
 class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateMixin {
@@ -29,7 +33,12 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
   File? _selectedImage;
   List<CloudPhoto> _cloudPhotos = [];
   bool _cloudLoading = true;
-  List<File> _localImages = [];
+  // The phone's most recent photos, read through the system photo library so
+  // the Local tab works on both iOS and Android.
+  static const _localPhotoLimit = 300;
+  List<AssetEntity> _localPhotos = [];
+  bool _localAccess = true;
+  final Map<String, Future<Uint8List?>> _thumbnails = {};
 
   late TabController _tabController;
 
@@ -41,36 +50,50 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
     // stays alive, so re-scan whenever the user switches to the Local tab.
     _tabController.addListener(() {
       if (!_tabController.indexIsChanging && _tabController.index == 0) {
-        _loadLocalImagesFromPictures();
+        _loadLocalPhotos();
       }
     });
     _fetchCloudImages();
-    _loadLocalImagesFromPictures();
+    _loadLocalPhotos();
   }
 
-  Future<void> _loadLocalImagesFromPictures() async {
-    const picturesPath = '/storage/emulated/0/Pictures';
-    final picturesDir = Directory(picturesPath);
-
+  Future<void> _loadLocalPhotos() async {
     try {
-      if (!await picturesDir.exists()) return;
-
-      final imageFiles = picturesDir.listSync().whereType<File>().where((file) {
-        final ext = file.path.toLowerCase();
-        return ext.endsWith('.jpg') || ext.endsWith('.jpeg') || ext.endsWith('.png');
-      }).toList();
-
-      // Oldest first, so the newest images are at the bottom of the grid.
-      final modified = {for (final file in imageFiles) file: file.lastModifiedSync()};
-      imageFiles.sort((a, b) => modified[a]!.compareTo(modified[b]!));
-
+      final permission = await PhotoManager.requestPermissionExtend(
+        requestOption: const PermissionRequestOption(androidPermission: AndroidPermission(
+          type: RequestType.image, mediaLocation: false)),
+      );
+      if (!permission.hasAccess) {
+        if (mounted) setState(() => _localAccess = false);
+        return;
+      }
+      final albums = await PhotoManager.getAssetPathList(onlyAll: true, type: RequestType.image);
+      final newestFirst = albums.isEmpty
+          ? <AssetEntity>[]
+          : await albums.first.getAssetListPaged(page: 0, size: _localPhotoLimit);
       if (!mounted) return;
       setState(() {
-        _localImages = imageFiles;
+        _localAccess = true;
+        // Oldest first, so the newest images are at the bottom of the grid.
+        _localPhotos = newestFirst.reversed.toList();
       });
-    } on FileSystemException catch (e) {
-      print("Error reading local images: $e");
+    } catch (e) {
+      debugPrint("Error reading local photos: $e");
     }
+  }
+
+  Future<Uint8List?> _thumbnail(AssetEntity photo) =>
+      _thumbnails.putIfAbsent(photo.id, () => photo.thumbnailDataWithSize(const ThumbnailSize.square(300)));
+
+  Future<void> _openLocalPhoto(AssetEntity photo) async {
+    // On iOS this is a JPEG copy of the photo, downloaded from iCloud if needed.
+    final file = await photo.file;
+    if (!mounted) return;
+    if (file == null) {
+      _showMessage("This photo couldn't be opened.");
+      return;
+    }
+    showDialog(context: context, builder: (context) => _buildLocalImageDialog(file, photo: photo));
   }
 
   /// Opens the editor, then refreshes both tabs once the user comes back,
@@ -81,7 +104,7 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
       MaterialPageRoute(builder: (context) => EditingImages(imageUrl: imageUrl)),
     );
     if (!mounted) return;
-    await _loadLocalImagesFromPictures();
+    await _loadLocalPhotos();
     await _fetchCloudImages();
   }
 
@@ -89,6 +112,7 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
     final pickedFile = await _picker.pickImage(source: ImageSource.gallery);
     if (pickedFile != null) {
       final imageFile = File(pickedFile.path);
+      if (!mounted) return;
       setState(() {
         _selectedImage = imageFile;
       });
@@ -113,25 +137,39 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
       final user = await Amplify.Auth.getCurrentUser();
       final userID = user.userId;
       final photoID = Uuid().v4();
-      final fileName = '${userID}_$photoID.jpg';
-
-      final bytes = await _selectedImage!.readAsBytes();
+      final (bytes, contentType, extension) = await _uploadable(await _selectedImage!.readAsBytes());
+      final fileName = '${userID}_$photoID.$extension';
 
       // Upload straight to the configured S3 bucket using the signed-in
       // user's Cognito identity pool credentials.
       await Amplify.Storage.uploadData(
-        data: StorageDataPayload.bytes(bytes, contentType: 'image/jpeg'),
+        data: StorageDataPayload.bytes(bytes, contentType: contentType),
         path: StoragePath.fromString(fileName),
       ).result;
       return fileName;
     } on StorageException catch (e) {
-      print("Error uploading image: ${e.message}");
+      debugPrint("Error uploading image: ${e.message}");
       _showMessage('Upload failed: ${e.message}');
     } catch (e) {
-      print("Error uploading image: $e");
+      debugPrint("Error uploading image: $e");
       _showMessage('Upload failed: $e');
     }
     return null;
+  }
+
+  /// The image as JPEG or PNG, the formats the credibility check can read.
+  /// Anything else, such as an iPhone's HEIC photo, becomes a PNG at most
+  /// 2048 pixels wide, which keeps it under Textract's 10 MB limit.
+  Future<(Uint8List, String, String)> _uploadable(Uint8List bytes) async {
+    if (bytes.length > 3 && bytes[0] == 0xFF && bytes[1] == 0xD8) return (bytes, 'image/jpeg', 'jpg');
+    if (bytes.length > 3 && bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47) {
+      return (bytes, 'image/png', 'png');
+    }
+    final descriptor = await ui.ImageDescriptor.encoded(await ui.ImmutableBuffer.fromUint8List(bytes));
+    final codec = await descriptor.instantiateCodec(targetWidth: min(descriptor.width, 2048));
+    final frame = await codec.getNextFrame();
+    final png = await frame.image.toByteData(format: ui.ImageByteFormat.png);
+    return (png!.buffer.asUint8List(), 'image/png', 'png');
   }
 
   Future<void> _uploadAndEdit() async {
@@ -154,13 +192,13 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
     await _fetchCloudImages();
   }
 
-  /// Permanently deletes a photo from the phone after the user confirms.
-  Future<void> _deleteLocalImage(File file) async {
+  /// Deletes a photo from the phone after the user confirms; the system asks once more.
+  Future<void> _deleteLocalPhoto(AssetEntity photo) async {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Delete photo?'),
-        content: const Text('This permanently deletes the photo from your phone. It cannot be undone.'),
+        content: const Text('This deletes the photo from your phone. It cannot be undone.'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
           TextButton(
@@ -172,25 +210,23 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
     );
     if (confirmed != true || !mounted) return;
     try {
-      await file.delete();
-      if (!mounted) return;
+      final deleted = await PhotoManager.editor.deleteWithIds([photo.id]);
+      if (!mounted || !deleted.contains(photo.id)) return; // cancelled in the system dialog
       Navigator.pop(context); // close the photo dialog
-      setState(() => _localImages.remove(file));
+      setState(() => _localPhotos.remove(photo));
       _showMessage('Photo deleted');
-    } on FileSystemException catch (e) {
-      print("Error deleting local image: $e");
-      // Android only lets an app delete photos it saved itself.
-      _showMessage("This photo couldn't be deleted. It may belong to another app.");
+    } catch (e) {
+      debugPrint("Error deleting local photo: $e");
+      _showMessage("This photo couldn't be deleted.");
     }
   }
 
   Future<String> _fetchCloudImageURL(String fileName) async {
     try {
-      final urlOperation = await Amplify.Storage.getUrl(path: StoragePath.fromString(fileName));
-      final urlResult = await urlOperation.result;
+      final urlResult = await Amplify.Storage.getUrl(path: StoragePath.fromString(fileName)).result;
       return urlResult.url.toString();
     } catch (e) {
-      print("Error fetching cloud image URL: $e");
+      debugPrint("Error fetching cloud image URL: $e");
       return "";
     }
   }
@@ -219,7 +255,7 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
       if (!mounted) return;
       setState(() => _cloudPhotos = photos);
     } catch (e) {
-      print("Error fetching cloud images: $e");
+      debugPrint("Error fetching cloud images: $e");
     } finally {
       if (mounted) setState(() => _cloudLoading = false);
     }
@@ -227,13 +263,13 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
 
   Future<void> _deleteCloudImage(CloudPhoto photo) async {
     try {
-      await Amplify.Storage.remove(path: StoragePath.fromString(photo.path));
-
+      await Amplify.Storage.remove(path: StoragePath.fromString(photo.path)).result;
+      if (!mounted) return;
       setState(() {
         _cloudPhotos.remove(photo);
       });
     } catch (e) {
-      print("Error deleting image: $e");
+      debugPrint("Error deleting image: $e");
     }
   }
 
@@ -241,18 +277,19 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
     if (url.isNotEmpty) {
       try {
         await DBHelper.insertFavorite(url);
+        if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Added to Favorites")),
         );
       } catch (e) {
-        print("Error saving to favorites: $e");
+        debugPrint("Error saving to favorites: $e");
       }
     }
   }
 
-  /// [canDelete] is only true for photos in the Local tab; a photo picked from
-  /// the gallery is a temporary copy, so deleting it would mean nothing.
-  AlertDialog _buildLocalImageDialog(File imageFile, {bool canDelete = false}) {
+  /// [photo] is set for photos in the Local tab, which can be deleted; a photo
+  /// picked from the gallery is a temporary copy, so deleting it would mean nothing.
+  AlertDialog _buildLocalImageDialog(File imageFile, {AssetEntity? photo}) {
     void upload(Future<void> Function() then) {
       setState(() {
         _selectedImage = imageFile;
@@ -265,9 +302,9 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
     return AlertDialog(
       content: Image.file(imageFile, fit: BoxFit.cover),
       actions: [
-        if (canDelete)
+        if (photo != null)
           TextButton(
-            onPressed: () => _deleteLocalImage(imageFile),
+            onPressed: () => _deleteLocalPhoto(photo),
             child: const Text('Delete', style: TextStyle(color: Colors.red)),
           ),
         TextButton(
@@ -335,6 +372,50 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
     );
   }
 
+  Widget _localTab() {
+    if (!_localAccess) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Text('CloudLens needs access to your photos to show them here.', textAlign: TextAlign.center),
+            const SizedBox(height: 12),
+            ElevatedButton(onPressed: PhotoManager.openSetting, child: const Text('Open Settings')),
+          ]),
+        ),
+      );
+    }
+    return RefreshIndicator(
+      onRefresh: _loadLocalPhotos,
+      child: _localPhotos.isEmpty
+          ? ListView(children: const [
+              SizedBox(height: 200),
+              Center(child: Text("No local images available.")),
+            ])
+          : GridView.builder(
+              padding: const EdgeInsets.all(8.0),
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 3,
+                crossAxisSpacing: 8.0,
+                mainAxisSpacing: 8.0,
+              ),
+              itemCount: _localPhotos.length,
+              itemBuilder: (context, index) {
+                final photo = _localPhotos[index];
+                return GestureDetector(
+                  onTap: () => _openLocalPhoto(photo),
+                  child: FutureBuilder<Uint8List?>(
+                    future: _thumbnail(photo),
+                    builder: (context, snapshot) => snapshot.data == null
+                        ? Container(color: Colors.white24)
+                        : Image.memory(snapshot.data!, fit: BoxFit.cover, gaplessPlayback: true),
+                  ),
+                );
+              },
+            ),
+    );
+  }
+
   Widget _cloudTab() {
     if (_cloudLoading && _cloudPhotos.isEmpty) {
       return const Center(child: CircularProgressIndicator());
@@ -395,29 +476,7 @@ class _PhotosPageState extends State<PhotosPage> with SingleTickerProviderStateM
           TabBarView(
             controller: _tabController,
             children: [
-              _localImages.isEmpty
-                  ? const Center(child: Text("No local images available."))
-                  : GridView.builder(
-                      padding: const EdgeInsets.all(8.0),
-                      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                        crossAxisCount: 3,
-                        crossAxisSpacing: 8.0,
-                        mainAxisSpacing: 8.0,
-                      ),
-                      itemCount: _localImages.length,
-                      itemBuilder: (context, index) {
-                        return GestureDetector(
-                          onTap: () {
-                            final selected = _localImages[index];
-                            showDialog(
-                              context: context,
-                              builder: (context) => _buildLocalImageDialog(selected, canDelete: true),
-                            );
-                          },
-                          child: Image.file(_localImages[index], fit: BoxFit.cover),
-                        );
-                      },
-                    ),
+              _localTab(),
               _cloudTab(),
             ],
           ),

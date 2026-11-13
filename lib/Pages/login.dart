@@ -12,20 +12,21 @@ class LoginPage extends StatefulWidget {
   const LoginPage({super.key, required this.signOutCallback});
 
   @override
-  _LoginPageState createState() => _LoginPageState();
+  State<LoginPage> createState() => _LoginPageState();
 }
 
 class _LoginPageState extends State<LoginPage> {
   final TextEditingController emailController = TextEditingController();
   final TextEditingController passwordController = TextEditingController();
 
-  Future<void> signIn(String email, String password, BuildContext context) async {
+  Future<void> signIn(String email, String password) async {
     try {
       final signInResult = await Amplify.Auth.signIn(
         username: email,
         password: password,
       );
 
+      if (!mounted) return;
       if (signInResult.isSignedIn) {
         Navigator.pushReplacement(
           context,
@@ -58,7 +59,7 @@ class _LoginPageState extends State<LoginPage> {
       String errorMessage = 'An unexpected error occurred. Please try again later.';
 
       if (e is AuthException) {
-        final authError = e as AuthException;
+        final authError = e;
 
         if (authError.message.contains('UserNotFoundException')) {
           errorMessage = 'No account found with this email. Please sign up first.';
@@ -78,11 +79,12 @@ class _LoginPageState extends State<LoginPage> {
       }
 
       showErrorSnackBar(errorMessage);
-      print('Error signing in: $e');
+      debugPrint('Error signing in: $e');
     }
   }
 
   void showErrorSnackBar(String message) {
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(message)),
     );
@@ -93,7 +95,7 @@ class _LoginPageState extends State<LoginPage> {
     String password = passwordController.text.trim();
 
     if (email.isNotEmpty && password.isNotEmpty) {
-      signIn(email, password, context);
+      signIn(email, password);
     } else {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text("Please enter both email and password")),
@@ -169,7 +171,7 @@ class _LoginPageState extends State<LoginPage> {
                       borderRadius: BorderRadius.circular(30.0),
                       boxShadow: [
                         BoxShadow(
-                          color: Colors.black.withOpacity(0.1),
+                          color: Colors.black.withValues(alpha: 0.1),
                           spreadRadius: 2,
                           blurRadius: 5,
                           offset: const Offset(0, 2),
@@ -194,7 +196,7 @@ class _LoginPageState extends State<LoginPage> {
                       borderRadius: BorderRadius.circular(30.0),
                       boxShadow: [
                         BoxShadow(
-                          color: Colors.black.withOpacity(0.1),
+                          color: Colors.black.withValues(alpha: 0.1),
                           spreadRadius: 2,
                           blurRadius: 5,
                           offset: const Offset(0, 2),

@@ -15,8 +15,11 @@ from fact-checking sites, or headlined "Fact check", count as fact-checks.
 """
 
 import concurrent.futures
+import email.utils
 import json
+import random
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -87,26 +90,40 @@ class TrustedSources:
         return next((d for d, e in self.by_domain.items() if (e.get("name") or "").lower() == name), None)
 
 
-def _http_get_json(url, timeout=TIMEOUT_SECONDS, headers=None):
+RETRY_DELAYS = (1.0, 2.5)  # seconds to wait before each retry of a busy or failed request
+_RETRY_CODES = {429, 500, 502, 503, 504}
+
+
+def _http_get(url, timeout, headers):
+    """The response body. A rate limit (HTTP 429), a server error or a timeout is
+    retried after a short wait: one busy provider otherwise changes which sources a
+    check finds, so the same screenshot could get a different verdict."""
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
+    for attempt in range(len(RETRY_DELAYS) + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read()
+        except urllib.error.HTTPError as e:
+            if e.code not in _RETRY_CODES or attempt == len(RETRY_DELAYS):
+                # Never include the URL in the message: some providers carry the key in it.
+                raise EvidenceError(f"HTTP {e.code}") from None
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt == len(RETRY_DELAYS):
+                raise EvidenceError(f"request failed: {type(e).__name__}") from None
+        time.sleep(RETRY_DELAYS[attempt] * (1 + random.random() / 2))
+
+
+def _http_get_json(url, timeout=TIMEOUT_SECONDS, headers=None):
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        # Never include the URL in the message: some providers carry the key in it.
-        raise EvidenceError(f"HTTP {e.code}") from None
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        return json.loads(_http_get(url, timeout, headers).decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
         raise EvidenceError(f"request failed: {type(e).__name__}") from None
 
 
 def _http_get_xml(url, timeout=TIMEOUT_SECONDS):
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return ET.fromstring(response.read())
-    except urllib.error.HTTPError as e:
-        raise EvidenceError(f"HTTP {e.code}") from None
-    except (urllib.error.URLError, TimeoutError, ET.ParseError) as e:
+        return ET.fromstring(_http_get(url, timeout, None))
+    except ET.ParseError as e:
         raise EvidenceError(f"request failed: {type(e).__name__}") from None
 
 
@@ -125,12 +142,24 @@ def _run_all(search, queries):
     return results
 
 
-def _item(kind, provider, url, title, sources, publisher="", rating="", summary="", claim_reviewed="", domain=None):
+def _item(kind, provider, url, title, sources, publisher="", rating="", summary="", claim_reviewed="", domain=None,
+          date=""):
     domain = normalize_domain(domain or url)
     return {"kind": kind, "provider": provider, "domain": domain,
             "publisher": sources.name(domain, publisher or domain), "url": url, "title": (title or "").strip(),
             "rating": rating or "", "summary": re.sub(r"<[^>]+>", "", summary or "").strip()[:400],
-            "claim_reviewed": claim_reviewed or "", "weight": sources.weight(domain)}
+            "claim_reviewed": claim_reviewed or "", "weight": sources.weight(domain), "date": _day(date)}
+
+
+def _day(value):
+    """'2022-09-08T17:30:00Z' or 'Thu, 08 Sep 2022 17:30:00 GMT' -> '2022-09-08'; '' if unknown."""
+    value = (value or "").strip()
+    if re.match(r"\d{4}-\d{2}-\d{2}", value):
+        return value[:10]
+    try:
+        return email.utils.parsedate_to_datetime(value).date().isoformat()
+    except (TypeError, ValueError, IndexError):
+        return ""
 
 
 SHORT_QUERY_WORDS = 4
@@ -161,7 +190,8 @@ def google_fact_check(queries, key, sources, limit):
             publisher = review.get("publisher") or {}
             items.append(_item("fact_check", "google_fact_check", review.get("url", ""), review.get("title"),
                                sources, publisher=publisher.get("name"), rating=review.get("textualRating"),
-                               claim_reviewed=claim.get("text"), domain=publisher.get("site") or review.get("url")))
+                               claim_reviewed=claim.get("text"), domain=publisher.get("site") or review.get("url"),
+                               date=review.get("reviewDate") or claim.get("claimDate")))
     return items
 
 
@@ -173,7 +203,8 @@ def newsapi(query, key, sources, limit):
     if data.get("status") != "ok":
         raise EvidenceError(f"NewsAPI error: {data.get('code')}")
     return [_item("news", "newsapi", a.get("url", ""), a.get("title"), sources,
-                  publisher=(a.get("source") or {}).get("name"), summary=a.get("description"))
+                  publisher=(a.get("source") or {}).get("name"), summary=a.get("description"),
+                  date=a.get("publishedAt"))
             for a in data.get("articles", [])]
 
 
@@ -186,24 +217,26 @@ def guardian(query, key, sources, limit):
     if data.get("status") != "ok":
         raise EvidenceError("Guardian API error")
     return [_item("news", "guardian", r.get("webUrl", ""), r.get("webTitle"), sources, publisher="The Guardian",
-                  summary=(r.get("fields") or {}).get("trailText"))
+                  summary=(r.get("fields") or {}).get("trailText"), date=r.get("webPublicationDate"))
             for r in data.get("results", [])]
 
 
 _FACT_CHECK_HEADLINE = re.compile(r"\bfact[ -]?check", re.I)
 
 
-def _feed_queries(query):
-    """News feed searches: the claim's keywords, the same asking for fact-checks, and its core words."""
-    return list(dict.fromkeys([query, f"{query} fact check", short_query(query)]))
+def _feed_queries(queries):
+    """News feed searches: the claim's keywords, the same asking for fact-checks, and the story's
+    name (its topic query, or else the keywords' core words). queries: keywords, or [keywords, topic]."""
+    query, *topic = [queries] if isinstance(queries, str) else list(queries)
+    return list(dict.fromkeys([query, f"{query} fact check", (topic and topic[0]) or short_query(query)]))
 
 
-def _feed_item(provider, url, title, sources, publisher, domain, summary=""):
+def _feed_item(provider, url, title, sources, publisher, domain, summary="", date=""):
     """A news feed entry; articles by fact-checkers or headlined "Fact check" count as fact-checks."""
     domain = normalize_domain(domain or url)
     is_fact_check = sources.category(domain) == "fact_checker" or _FACT_CHECK_HEADLINE.search(title or "")
     return _item("fact_check" if is_fact_check else "news", provider, url, title, sources, publisher=publisher,
-                 summary=summary, domain=domain)
+                 summary=summary, domain=domain, date=date)
 
 
 def google_news(query, key, sources, limit):
@@ -219,7 +252,8 @@ def google_news(query, key, sources, limit):
             # Headlines end with " - Publisher".
             title = entry.findtext("title", "").removesuffix(f" - {publisher}")
             items.append(_feed_item("google_news", entry.findtext("link", ""), title, sources, publisher,
-                                    source.get("url", "") if source is not None else ""))
+                                    source.get("url", "") if source is not None else "",
+                                    date=entry.findtext("pubDate", "")))
     return items
 
 
@@ -240,7 +274,7 @@ def bing_news(query, key, sources, limit):
                 publisher = publisher.removesuffix(" on MSN")
                 domain = sources.domain_named(publisher) or domain
             items.append(_feed_item("bing_news", url, entry.findtext("title", ""), sources, publisher, domain,
-                                    summary=entry.findtext("description", "")))
+                                    summary=entry.findtext("description", ""), date=entry.findtext("pubDate", "")))
     return items
 
 
@@ -262,17 +296,21 @@ def _name_phrases(claim):
 def wikipedia(queries, key, sources, limit):
     """The opening paragraphs of the Wikipedia articles about the names in the claim
     and of the best search matches, for settled facts ("the capital of Australia is
-    Canberra") that news no longer reports. queries: [keywords, claim]."""
+    Canberra") that news no longer reports. queries: [keywords, claim] or
+    [keywords, claim, topic]; the topic ("water boiling point") is searched too, since
+    it names the article that states a settled fact better than the claim's keywords."""
     queries = [queries] if isinstance(queries, str) else list(queries)
+    claim = queries[1] if len(queries) > 1 else queries[0]
 
     def api(params):
         params = urllib.parse.urlencode({**params, "format": "json", "formatversion": 2})
         return _http_get_json(f"https://en.wikipedia.org/w/api.php?{params}").get("query") or {}
 
-    hits = api({"action": "query", "list": "search", "srsearch": queries[0], "srlimit": WIKI_ARTICLES}).get("search", [])
+    hits = [h for q in dict.fromkeys([queries[0], *queries[2:3]]) if q
+            for h in api({"action": "query", "list": "search", "srsearch": q, "srlimit": WIKI_ARTICLES}).get("search", [])]
     # Search ranks side articles ("Second cabinet of Donald Trump") above the main
     # one, so the articles named in the claim are fetched directly too.
-    named = _name_phrases(queries[-1])[:WIKI_ARTICLES + 1]
+    named = _name_phrases(claim)[:WIKI_ARTICLES + 1]
     titles = list(dict.fromkeys([h["title"] for h in hits] + named))
     if not titles:
         return []
@@ -296,11 +334,13 @@ PROVIDERS = [("google_fact_check", google_fact_check, True), ("google_news", goo
 PRIMARY = "google_fact_check"
 
 
-def find_evidence(query, keys, sources, limit, enabled=None, also_try=()):
+def find_evidence(query, keys, sources, limit, enabled=None, also_try=(), topic=""):
     """Searches every usable provider in parallel.
 
     keys maps provider name to its API key (missing or empty means skip it).
     also_try: other phrasings for the fact-check search when `query` finds nothing.
+    topic: the story's name in 2 to 4 words ("moon landing hoax"). The fact-check search
+    matches whole sentences poorly, and this finds fact-checks of the same story.
     Returns (up to `limit` trusted items, fact-checks first, then by weight;
              {provider: "ok" | "failed" | "skipped"}).
     """
@@ -310,7 +350,14 @@ def find_evidence(query, keys, sources, limit, enabled=None, also_try=()):
             if (enabled is not None and name not in enabled) or (needs_key and not keys.get(name)):
                 report[name] = "skipped"
                 continue
-            queries = [query, *also_try] if name in (PRIMARY, "wikipedia") else query
+            if name == PRIMARY:
+                queries = [q for q in (query, *also_try, topic) if q]
+            elif name == "wikipedia":
+                queries = [query, *(also_try[:1] or [query]), topic]
+            elif name in ("google_news", "bing_news"):
+                queries = [query, topic] if topic else query
+            else:
+                queries = query
             futures[pool.submit(search, queries, keys.get(name), sources, limit)] = name
         found = []
         for future in concurrent.futures.as_completed(futures):
@@ -331,7 +378,7 @@ def find_evidence(query, keys, sources, limit, enabled=None, also_try=()):
         key = (item["domain"], title) if title else item["url"]
         if key in unique:
             kept = unique[key]
-            for field in ("rating", "summary", "claim_reviewed"):
+            for field in ("rating", "summary", "claim_reviewed", "date"):
                 kept[field] = kept[field] or item[field]
         else:
             unique[key] = item
@@ -349,27 +396,52 @@ def find_evidence(query, keys, sources, limit, enabled=None, also_try=()):
             item["headline_core"] = relevance(short_query(query), headline)
         if item["kind"] == "reference":
             _match_sentence(query, claim, names, item)
+            if topic:
+                # The sentence that states a settled fact can share few of the claim's own
+                # keywords ("water boils at 100 °C" for "... 100 degrees Celsius at sea level").
+                # This only lets the article be judged; the rules still read the claim's own match.
+                by_topic = dict(item)
+                _match_sentence(topic, claim, _names(topic, claim), by_topic)
+                item["story_match"] = max(item["relevance"], by_topic["relevance"])
         if item["kind"] == "fact_check":
             item["claim_match"] = claim_match(query, item)
+            # "Viral images show X" rated fake is about the pictures, not about whether X happened.
+            item["about_media"] = bool(_MEDIA.search(item["claim_reviewed"] or item["title"])) and not _MEDIA.search(claim)
+            # A fact-check of the same story can word it differently ("moon landing hoax").
+            item["story_match"] = max(item["claim_match"], claim_match(topic, item) if topic else 0.0)
             # Fact-checks of plainly different claims would only take the places of useful results.
-            if item["claim_match"] >= MIN_CLAIM_MATCH - 0.2:
+            if item["story_match"] >= MIN_CLAIM_MATCH - 0.2:
                 items.append(item)
         # News search matches loosely; skip articles that share few of the claim's words.
-        elif item["relevance"] >= MIN_RELEVANCE:
+        elif item.get("story_match", item["relevance"]) >= MIN_RELEVANCE:
             items.append(item)
     order = {name: i for i, (name, _, _) in enumerate(PROVIDERS)}
     kinds = {"fact_check": 0, "reference": 1, "news": 2}
     items.sort(key=lambda i: (kinds[i["kind"]], not i.get("about_subject", False),
-                              -round(i.get("claim_match", i["relevance"]), 1), -i["weight"], order[i["provider"]]))
+                              -round(i.get("story_match", i["relevance"]), 1), -i["weight"], order[i["provider"]]))
     # Prefer different sites: a site's second article only gets a slot after every site has one.
     firsts, repeats, sites = [], [], set()
     for item in items:
         (repeats if item["domain"] in sites else firsts).append(item)
         sites.add(item["domain"])
-    return (firsts + repeats)[:limit], report
+    # Fact-checks and encyclopedia articles have only some of the places, so news that
+    # reports the event is always judged too: fact-checks of other claims about the
+    # same story ("voter ID" for "Trump won the election") would otherwise take them all.
+    caps = {"fact_check": (limit + 1) // 2, "reference": MAX_REFERENCES}
+    chosen, spare, taken = [], [], {}
+    for item in firsts + repeats:
+        if taken.get(item["kind"], 0) < caps.get(item["kind"], limit):
+            chosen.append(item)
+            taken[item["kind"]] = taken.get(item["kind"], 0) + 1
+        else:
+            spare.append(item)
+    return (chosen + spare)[:limit], report  # places nobody else wants go to the spare ones
 
 
 MIN_RELEVANCE = 0.4
+_MEDIA = re.compile(r"\b(images?|photos?|photographs?|pictures?|pics?|videos?|visuals?|footage|clips?|screenshots?|"
+                    r"ai[- ]generated|deepfakes?|edited|doctored|altered)\b", re.I)
+MAX_REFERENCES = 2  # encyclopedia articles among the results, unless nothing else is found
 _WORD = re.compile(r"[a-z0-9%$]+")
 _COMMON = frozenset("the and for with that this are was were has have had from but not you its our their".split())
 
@@ -547,6 +619,29 @@ def match_strength(item):
     else:
         strength = item.get("headline_match", item.get("relevance", 0.0))
     return round(max(0.0, min(1.0, strength)), 2)
+
+
+OUTDATED_AFTER_NEWS = 2  # trusted news reports, published later, that make a fact-check outdated
+OUTDATED_NEWS_STRENGTH = 0.7
+
+
+def outdated_fact_checks(items, stances, strengths):
+    """Indexes of fact-checks that rate the claim false but are older than at least 2
+    trusted news reports (from different sites) that later report it as fact. They
+    reviewed an earlier hoax, such as a false report of a death before the real one
+    ("Another hoax claims Queen Elizabeth II is dead", 2021, then her death in 2022),
+    not the event the news now reports. A fact-check newer than the news ("Senate did
+    NOT just confirm..." about an old confirmation) is never outdated."""
+    outdated = set()
+    for i, (item, stance) in enumerate(zip(items, stances)):
+        if item["kind"] != "fact_check" or stance not in ("REFUTES", "MIXED") or not item.get("date"):
+            continue
+        later = {other["domain"] for other, s, m in zip(items, stances, strengths)
+                 if other["kind"] == "news" and s == "SUPPORTS" and m >= OUTDATED_NEWS_STRENGTH
+                 and other.get("date", "") > item["date"]}
+        if len(later) >= OUTDATED_AFTER_NEWS:
+            outdated.add(i)
+    return outdated
 
 
 def fallback_stances(items):

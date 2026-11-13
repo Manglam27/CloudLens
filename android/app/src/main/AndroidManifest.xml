@@ -1,5 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- Adding Internet permission for AWS and network connectivity -->
+    <!-- AWS and the photo-edit and check APIs. Debug builds add this on their own; release builds need it. -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- The Local tab reads the photo library: Android 13 and later ask for these, older versions for storage. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
 

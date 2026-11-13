@@ -11,7 +11,7 @@ import 'package:cloud_lens/database.dart'; // only if you use _saveToFavorites
 class EditingImages extends StatefulWidget {
   final String imageUrl;
 
-  const EditingImages({Key? key, required this.imageUrl}) : super(key: key);
+  const EditingImages({super.key, required this.imageUrl});
 
   @override
   State<EditingImages> createState() => _EditingImagesState();
@@ -61,7 +61,7 @@ class _EditingImagesState extends State<EditingImages> {
     try {
       final originalResponse = await http.get(Uri.parse(widget.imageUrl));
       if (originalResponse.statusCode != 200) {
-        print('Failed to load original image');
+        debugPrint('Failed to load original image');
         setState(() => isLoading = false);
         return;
       }
@@ -101,12 +101,10 @@ class _EditingImagesState extends State<EditingImages> {
         // The user moved on from the previous filter without saving it.
         if (previousPreviewKey != null) _discardPreview(previousPreviewKey);
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("❌ Failed: ${response.body}")),
-        );
+        _showMessage("❌ Failed: ${response.body}");
       }
     } catch (e) {
-      print('Error calling Lambda: $e');
+      debugPrint('Error calling Lambda: $e');
     }
 
     if (mounted) setState(() => isLoading = false);
@@ -125,7 +123,7 @@ class _EditingImagesState extends State<EditingImages> {
   void _discardPreview(String key) {
     Amplify.Storage.remove(path: StoragePath.fromString(key)).result.then(
       (_) {},
-      onError: (Object e) => print('Could not discard edit preview $key: $e'),
+      onError: (Object e) => debugPrint('Could not discard edit preview $key: $e'),
     );
   }
 
@@ -172,7 +170,7 @@ class _EditingImagesState extends State<EditingImages> {
     try {
       await _keepCurrentEdit();
     } catch (e) {
-      print('Could not keep edit: $e');
+      debugPrint('Could not keep edit: $e');
       _showMessage("❌ Could not save the edit. Please try again.");
       return;
     }
@@ -189,11 +187,10 @@ class _EditingImagesState extends State<EditingImages> {
         name: 'cloudlens_${DateTime.now().millisecondsSinceEpoch}',
         quality: 100,
       );
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Successfully saved to gallery")),
-      );
+      _showMessage("Successfully saved to gallery");
     } catch (e) {
-      print('Save error: $e');
+      debugPrint('Save error: $e');
+      _showMessage("❌ Could not save to the gallery.");
     }
   }
 
@@ -202,28 +199,21 @@ class _EditingImagesState extends State<EditingImages> {
       // A favorite stores the image's cloud link, so the edit must be kept.
       await _keepCurrentEdit();
     } catch (e) {
-      print('Could not keep edit: $e');
+      debugPrint('Could not keep edit: $e');
       _showMessage("❌ Could not save the edit. Please try again.");
       return;
     }
     String urlToSave = editedImageUrl ?? widget.imageUrl;
-    print('Attempting to save URL: $urlToSave'); // Debugging line
     if (urlToSave.isNotEmpty) {
       try {
         await DBHelper.insertFavorite(urlToSave);
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Added to Favorites")),
-        );
+        _showMessage("Added to Favorites");
       } catch (e) {
-        print("Error saving to favorites: $e");
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("❌ Failed to add to favorites")),
-        );
+        debugPrint("Error saving to favorites: $e");
+        _showMessage("❌ Failed to add to favorites");
       }
     } else {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("❌ No image to save to favorites")),
-      );
+      _showMessage("❌ No image to save to favorites");
     }
   }
 
@@ -273,11 +263,11 @@ class _EditingImagesState extends State<EditingImages> {
                       padding: const EdgeInsets.symmetric(vertical: 4.0),
                       child: ElevatedButton(
                         onPressed: isLoading ? null : () => _applyEdit(method),
+                        style: _buttonStyle(),
                         child: Text(
                           method.toUpperCase(),
                           style: const TextStyle(fontWeight: FontWeight.bold),
                         ),
-                        style: _buttonStyle(),
                       ),
                     );
                   }).toList(),
